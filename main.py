@@ -512,8 +512,8 @@ def main():
             for k in ("productName", "brandName", "variant_Color", "variant_Storage", "variant_RAM")
         ))
 
-    end = now()
-    start = end - timedelta(hours=24)
+    start = datetime(2026, 9, 18, 0, 0, tzinfo=IST)
+    end = datetime(2026, 9, 19, 0, 0, tzinfo=IST)
     print(f"Window: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
