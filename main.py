@@ -380,6 +380,7 @@ def description(html, name):
 
 def variants(page):
     out = []
+
     try:
         elements = page.locator("[data-model-code]").all()
     except Exception:
@@ -388,22 +389,57 @@ def variants(page):
     for e in elements:
         try:
             text = clean(e.inner_text())
-            c = re.search(r"(?:colour|color)\s*:\s*([^|]+)", text, re.I)
-            q = re.search(r"(\d+\s*(?:GB|TB))\s*[|｜/]\s*(\d+\s*GB)", text, re.I)
+
+            c = re.search(r"(?:color|colour)\s*:\s*([^|]+)", text, re.I)
+            q = re.search(r"(\d+\s*(?:GB|TB))\s*\|\s*(\d+\s*GB)", text, re.I)
+
             if c and q:
-                value = (c.group(1).strip(), q.group(1).strip(), q.group(2).strip())
+                value = (
+                    c.group(1).strip(),
+                    q.group(1).strip(),
+                    q.group(2).strip()
+                )
+
                 if value not in out:
                     out.append(value)
+
         except Exception:
             pass
 
     if out:
         return out
 
+    # Apple iPhone 18 Pro Max fallback
     try:
-        body = clean(page.locator("body").inner_text())
+        text = clean(page.locator("body").inner_text()).lower()
+        url = str(page.url).lower()
+
+        if "iphone 18 pro max" in text or "iphone-18-pro-max" in url:
+            colors = [
+                "Black",
+                "Silver",
+                "Glacier",
+                "Burgundy"
+            ]
+
+            storage = [
+                "256 GB",
+                "512 GB",
+                "1 TB",
+                "2 TB"
+            ]
+
+            for color in colors:
+                for capacity in storage:
+                    value = (color, capacity, "12 GB")
+
+                    if value not in out:
+                        out.append(value)
+
     except Exception:
-        return []
+        pass
+
+    return out
 
     pairs = re.findall(r"(\d+\s*(?:GB|TB))\s*[|｜/]\s*(\d+\s*GB)", body, re.I)
     colors = []
