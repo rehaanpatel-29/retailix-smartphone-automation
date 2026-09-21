@@ -91,7 +91,7 @@ def now():
     return datetime.now(timezone.utc).astimezone(IST)
 
 
-def get(url, timeout=12):
+def get(url, timeout=8):
     try:
         r = S.get(url, timeout=timeout, allow_redirects=True)
         if r.status_code == 200 and "text" in r.headers.get("content-type", "").lower():
@@ -236,7 +236,7 @@ def rss_candidates(source, domains):
     for feed in dict.fromkeys(feeds):
         try:
             p = feedparser.parse(feed)
-            for e in p.entries[:40]:
+            for e in p.entries[:15]:
                 u, title = e.get("link"), clean(e.get("title", ""))
                 q = e.get("published_parsed") or e.get("updated_parsed")
                 if not u or not official(u, domains):
@@ -274,7 +274,7 @@ def html_candidates(source, domains):
 
 def rendered_candidates(page, source, domains):
     try:
-        page.goto(source, wait_until="domcontentloaded", timeout=35000)
+        page.goto(source, wait_until="domcontentloaded", timeout=15000)
         page.wait_for_timeout(1800)
         links = page.locator("a[href]").evaluate_all(
             """as => as.map(a => ({href:a.href||'',text:(a.innerText||a.textContent||'').trim()}))"""
@@ -307,7 +307,7 @@ def google_news_candidates(brand, domains):
     rows = []
     try:
         p = feedparser.parse(url)
-        for e in p.entries[:25]:
+        for e in p.entries[:10]:
             u, title = e.get("link"), clean(e.get("title", ""))
             q = e.get("published_parsed") or e.get("updated_parsed")
             dt = datetime(*q[:6], tzinfo=timezone.utc).astimezone(IST) if q else None
@@ -320,11 +320,10 @@ def google_news_candidates(brand, domains):
 
 def discover(brand, cfg, source_page=None):
     """
-    Fast discovery:
-    1) official India RSS/Atom feeds
-    2) lightweight links from official India pages
-    3) Google News only as a discovery fallback
-    Playwright is NOT used for discovery, keeping the daily job bounded.
+    FAST DISCOVERY
+    - Official India RSS/Atom + lightweight official HTML links.
+    - Google News is only a small fallback.
+    - Never uses Playwright for discovery.
     """
     rows = []
 
@@ -332,7 +331,7 @@ def discover(brand, cfg, source_page=None):
         rows += rss_candidates(source, cfg["domains"])
         rows += html_candidates(source, cfg["domains"])
 
-    if len(rows) < 5:
+    if len(rows) < 3:
         rows += google_news_candidates(brand, cfg["domains"])
 
     unique = {}
@@ -345,7 +344,7 @@ def discover(brand, cfg, source_page=None):
         key=lambda x: x[2] or datetime.min.replace(tzinfo=IST),
         reverse=True,
     )
-    return result[:12]
+    return result[:8]
 
 
 def product_name(title, brand):
@@ -447,8 +446,8 @@ def marketplace_support(page, brand, model):
         f"https://www.flipkart.com/search?q={q}",
     ):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(1500)
+            page.goto(url, wait_until="domcontentloaded", timeout=12000)
+            page.wait_for_timeout(700)
 
             if not result["description"]:
                 text = clean(page.locator("body").inner_text())
@@ -543,9 +542,22 @@ def main():
 
                 found = False
                 checked = 0
+                unknown_dates = 0
 
                 for candidate_url, hint_title, candidate_dt in candidates:
-                    if checked >= 12:
+                    # RSS dates are already known. Skip old items BEFORE
+                    # downloading their pages.
+                    if candidate_dt is not None:
+                        if candidate_dt < start or candidate_dt > end:
+                            continue
+                    else:
+                        # Only inspect a couple of candidates whose date is
+                        # unknown; this prevents a slow newsroom crawl.
+                        if unknown_dates >= 2:
+                            continue
+                        unknown_dates += 1
+
+                    if checked >= 6:
                         break
                     checked += 1
 
@@ -566,8 +578,8 @@ def main():
                     product_url = best_product_url(candidate_url, html, cfg["domains"])
 
                     try:
-                        product_page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
-                        product_page.wait_for_timeout(2500)
+                        product_page.goto(product_url, wait_until="domcontentloaded", timeout=20000)
+                        product_page.wait_for_timeout(1200)
 
                         vs = variants(product_page)
                         if not vs:
