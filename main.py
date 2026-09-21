@@ -394,11 +394,7 @@ def variants(page):
             q = re.search(r"(\d+\s*(?:GB|TB))\s*\|\s*(\d+\s*GB)", text, re.I)
 
             if c and q:
-                value = (
-                    c.group(1).strip(),
-                    q.group(1).strip(),
-                    q.group(2).strip()
-                )
+                value = (c.group(1).strip(), q.group(1).strip(), q.group(2).strip())
 
                 if value not in out:
                     out.append(value)
@@ -408,6 +404,8 @@ def variants(page):
 
     if out:
         return out
+
+    return []
 
     # Apple iPhone 18 Pro Max fallback
     try:
