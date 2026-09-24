@@ -10,6 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
+import feedparser
 
 # ============================================================
 # RETAILIX SMARTPHONE AUTOMATION
