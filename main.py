@@ -1,131 +1,123 @@
-from __future__ import annotations
-
 import re
+import time
 import shutil
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import urljoin, urlparse, quote_plus
+from urllib.parse import urljoin, quote_plus, urlparse
 
 import requests
-import feedparser
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
-BASE = Path(__file__).resolve().parent
-XLSX = BASE / "product_import_template (1).xlsx"
+# ============================================================
+# RETAILIX SMARTPHONE AUTOMATION
+# NDTV MOBILE DISCOVERY -> OFFICIAL INDIA BRAND VERIFICATION
+# ============================================================
+
+XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
 
-HEAD = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142.0 Safari/537.36",
-    "Accept-Language": "en-IN,en;q=0.9",
-}
-S = requests.Session()
-S.headers.update(HEAD)
-
 BRANDS = {
-    "APPLE": {
-        "domains": ["apple.com"],
-        "sources": [
-            "https://www.apple.com/in/newsroom/archive/",
-            "https://www.apple.com/in/newsroom/archive/iphone/",
-        ],
-    },
-    "SAMSUNG": {
-        "domains": ["samsung.com"],
-        "sources": [
-            "https://news.samsung.com/in/category/products",
-            "https://news.samsung.com/in/category/press-resources/press-release",
-            "https://news.samsung.com/in/latest",
-        ],
-    },
-    "VIVO": {"domains": ["vivo.com"], "sources": ["https://vivonewsroom.in/"]},
-    "OPPO": {
-        "domains": ["oppo.com"],
-        "sources": [
-            "https://www.oppo.com/in/newsroom/",
-            "https://www.oppo.com/in/newsroom/all/",
-        ],
-    },
-    "ONEPLUS": {"domains": ["oneplus.com"], "sources": ["https://www.oneplus.com/in"]},
-    "REALME": {"domains": ["realme.com"], "sources": ["https://www.realme.com/in/brand/newsroom"]},
-    "MOTOROLA": {
-        "domains": ["motorola.in", "motorola.com"],
-        "sources": ["https://www.motorola.in/"],
-    },
-    "INFINIX": {
-        "domains": ["infinixmobility.com", "infinixmobiles.in"],
-        "sources": ["https://www.infinixmobility.com/news/", "https://infinixmobiles.in/"],
-    },
-    "POCO": {"domains": ["mi.com"], "sources": ["https://www.mi.com/in/", "https://www.mi.com/in/phone/"]},
-    "REDMI": {"domains": ["mi.com"], "sources": ["https://www.mi.com/in/", "https://www.mi.com/in/phone/"]},
+    "APPLE": ["apple.com"],
+    "INFINIX": ["infinixmobility.com", "infinixmobiles.in"],
+    "MOTOROLA": ["motorola.in", "motorola.com"],
+    "ONEPLUS": ["oneplus.in", "oneplus.com"],
+    "OPPO": ["oppo.com"],
+    "POCO": ["mi.com"],
+    "REDMI": ["mi.com"],
+    "REALME": ["realme.com"],
+    "SAMSUNG": ["samsung.com"],
+    "VIVO": ["vivo.com"],
 }
 
-SMART = (
-    "smartphone", "iphone", "galaxy", "redmi", "poco", "mobile", "phone",
-    "reno", "find x", "find n", "nord", "oneplus", "narzo", "realme",
-    "moto", "edge", "razr", "zero", "note"
+NDTV_URLS = [
+    "https://www.ndtv.com/topic/mobile-phones",
+    "https://www.ndtv.com/topic/smartphone",
+    "https://www.ndtv.com/topic/launches",
+]
+
+HEADERS = [
+    "productName", "brandName", "categoryName", "subcategoryName",
+    "unit_name", "taxName", "discountName", "warrantyName",
+    "shortDescription", "longDescription", "is_featured", "is_digital",
+    "variant_Color", "variant_Storage", "variant_RAM",
+    "image1", "image1Primary", "image2", "image3", "image4"
+]
+
+SMART_WORDS = (
+    "smartphone", "smart phone", "mobile phone", "phone", "iphone",
+    "galaxy", "redmi", "poco", "oneplus", "nord", "oppo", "reno",
+    "find x", "find n", "vivo", "realme", "narzo", "motorola",
+    "moto", "edge", "razr", "infinix", "note"
 )
-LAUNCH = (
-    "launch", "launched", "launches", "introduces", "introduced",
-    "unveils", "unveiled", "debuts", "debut", "announces", "announced",
-    "available", "goes on sale", "sale begins", "now available",
-    "arrives in stores", "available in india", "launched in india",
+
+LAUNCH_WORDS = (
+    "launched", "launches", "launch", "introduced", "unveiled",
+    "debuts", "announced", "available in india", "launched in india",
+    "goes on sale", "sale begins", "now available", "arrives in stores"
 )
-BAD = (
+
+BAD_WORDS = (
     "upcoming", "rumour", "rumor", "leak", "leaked", "expected",
     "may launch", "could launch", "might launch", "tipped", "teased",
-    "teaser", "concept", "review", "comparison", "price hike",
-    "discount", "offer", "campaign", "event", "hands-on", "speculation",
+    "teaser", "review", "comparison", "discount", "offer", "concept",
+    "speculation", "hands-on"
 )
-HEADERS = [
-    "productName", "brandName", "categoryName", "subcategoryName", "unit_name",
-    "taxName", "discountName", "warrantyName", "shortDescription",
-    "longDescription", "is_featured", "is_digital", "variant_Color",
-    "variant_Storage", "variant_RAM", "image1", "image1Primary",
-    "image2", "image3", "image4"
-]
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/140 Safari/537.36"
+})
+
+
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def now():
-    return datetime.now(timezone.utc).astimezone(IST)
+    return datetime.now(IST)
 
 
-def get(url, timeout=8):
-    try:
-        r = S.get(url, timeout=timeout, allow_redirects=True)
-        if r.status_code == 200 and "text" in r.headers.get("content-type", "").lower():
-            return r.text
-    except requests.RequestException:
-        pass
-    return ""
+def normalize_url(url, base=None):
+    if not url:
+        return ""
+    return urljoin(base or "", url).split("#")[0]
 
 
-def norm(url, base):
-    return urljoin(base, url).split("#")[0]
-
-
-def official(url, domains):
+def same_domain(url, domains):
     host = urlparse(url).netloc.lower().split(":")[0]
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
-def clean(x):
-    return re.sub(r"\s+", " ", x or "").strip()
-
-
-def parse_date(value):
-    if not value:
-        return None
-    value = clean(value)
+def get_html(url, timeout=25):
     try:
-        d = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(IST)
+        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+        if r.ok and len(r.text) > 500:
+            return r.text
     except Exception:
         pass
-    for fmt in ("%d %B %Y", "%B %d, %Y", "%d %b %Y", "%b %d, %Y", "%Y-%m-%d"):
+    return ""
+
+
+def parse_date(text):
+    text = clean(text)
+    patterns = [
+        r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})",
+        r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+        r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})",
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if not m:
+            continue
         try:
-            return datetime.strptime(value, fmt).replace(tzinfo=IST)
+            if m.lastindex == 3:
+                if m.group(2).isdigit():
+                    return datetime.strptime(m.group(0), "%d/%m/%Y").replace(tzinfo=IST)
+                if m.group(1).isdigit():
+                    return datetime.strptime(m.group(0), "%d %B %Y").replace(tzinfo=IST)
+                return datetime.strptime(m.group(0), "%B %d, %Y").replace(tzinfo=IST)
         except Exception:
             pass
     return None
@@ -133,398 +125,430 @@ def parse_date(value):
 
 def article_date(html):
     soup = BeautifulSoup(html, "html.parser")
-    values = []
 
-    keys = (
-        "article:published_time", "article:modified_time", "datepublished",
-        "date", "published", "publishdate", "dc.date", "datecreated",
-        "parsely-pub-date"
-    )
-    for m in soup.find_all("meta"):
-        key = clean(m.get("property") or m.get("name")).lower()
-        val = m.get("content")
-        if val and any(k in key for k in keys):
-            values.append(val)
+    for attrs in (
+        {"property": "article:published_time"},
+        {"name": "publish-date"},
+        {"name": "date"},
+        {"itemprop": "datePublished"},
+    ):
+        m = soup.find("meta", attrs=attrs)
+        if m:
+            value = m.get("content") or m.get("datetime")
+            if value:
+                try:
+                    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    return dt.astimezone(IST)
+                except Exception:
+                    d = parse_date(value)
+                    if d:
+                        return d
 
-    for t in soup.find_all("time"):
-        if t.get("datetime"):
-            values.append(t.get("datetime"))
-        values.append(t.get_text(" ", strip=True))
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        raw = script.string or script.get_text()
-        for field in ("datePublished", "dateCreated", "dateModified"):
-            values += re.findall(rf'"{field}"\s*:\s*"([^"]+)"', raw, re.I)
-
-    for value in values:
+    for tag in soup.find_all(["time", "span"]):
+        value = tag.get("datetime") or tag.get_text(" ", strip=True)
         d = parse_date(value)
         if d:
             return d
 
-    text = soup.get_text(" ", strip=True)
-    patterns = [
-        r"\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})\b",
-        r"\b((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4})\b",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            d = parse_date(m.group(1))
-            if d:
-                return d
     return None
 
 
-def title_of(html, fallback=""):
-    soup = BeautifulSoup(html, "html.parser")
-    m = soup.find("meta", property="og:title")
-    if m and m.get("content"):
-        return clean(m["content"])
-    h1 = soup.find("h1")
-    if h1:
-        return clean(h1.get_text(" ", strip=True))
-    return clean(soup.title.get_text(" ", strip=True) if soup.title else fallback)
+def ndtv_candidates():
+    """
+    NDTV is the only discovery layer.
+    We inspect its mobile-phone/launch topic pages and collect article links.
+    """
+    out = {}
+    for base in NDTV_URLS:
+        html = get_html(base)
+        if not html:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        for a in soup.find_all("a", href=True):
+            url = normalize_url(a["href"], base)
+            title = clean(a.get_text(" ", strip=True))
+
+            if not url.startswith("https://www.ndtv.com/"):
+                continue
+            if len(title) < 15:
+                continue
+
+            blob = title.lower()
+            if not any(x in blob for x in SMART_WORDS):
+                continue
+
+            # Keep only useful launch-looking mobile stories.
+            # Article verification later is stricter.
+            if not any(x in blob for x in LAUNCH_WORDS):
+                continue
+
+            out[url] = title
+
+    return [(u, t) for u, t in out.items()]
 
 
-def brand_in_title(title, brand):
+def candidate_brand(title):
+    low = title.lower()
+
     aliases = {
-        "APPLE": ("apple", "iphone"), "SAMSUNG": ("samsung", "galaxy"),
-        "VIVO": ("vivo",), "OPPO": ("oppo",), "ONEPLUS": ("oneplus", "one plus"),
-        "REALME": ("realme",), "MOTOROLA": ("motorola", "moto"),
-        "INFINIX": ("infinix",), "POCO": ("poco",), "REDMI": ("redmi", "xiaomi"),
+        "APPLE": ["iphone", "apple"],
+        "INFINIX": ["infinix"],
+        "MOTOROLA": ["motorola", "moto"],
+        "ONEPLUS": ["oneplus", "one plus"],
+        "OPPO": ["oppo"],
+        "POCO": ["poco"],
+        "REDMI": ["redmi"],
+        "REALME": ["realme", "narzo"],
+        "SAMSUNG": ["samsung", "galaxy"],
+        "VIVO": ["vivo"],
     }
-    return any(x in title.lower() for x in aliases[brand])
+
+    for brand, words in aliases.items():
+        if any(w in low for w in words):
+            return brand
+    return None
 
 
-def qualifying(title, html, brand, dt, start, end):
-    if not dt or not (start <= dt <= end):
-        return False
-    if not brand_in_title(title, brand):
-        return False
-    if any(x in title.lower() for x in BAD):
+def qualifying_ndtv(title, html, brand, start, end):
+    low = (title + " " + BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:8000]).lower()
+
+    if any(x in low for x in BAD_WORDS):
         return False
 
-    body = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
-    blob = title.lower() + " " + body
+    aliases = {
+        "APPLE": ("apple", "iphone"),
+        "INFINIX": ("infinix",),
+        "MOTOROLA": ("motorola", "moto"),
+        "ONEPLUS": ("oneplus", "one plus"),
+        "OPPO": ("oppo",),
+        "POCO": ("poco",),
+        "REDMI": ("redmi",),
+        "REALME": ("realme", "narzo"),
+        "SAMSUNG": ("samsung", "galaxy"),
+        "VIVO": ("vivo",),
+    }
 
-    if not any(x in blob for x in SMART):
+    if not any(x in low for x in aliases[brand]):
         return False
-    if not any(x in blob for x in LAUNCH):
+
+    if not any(x in low for x in LAUNCH_WORDS):
         return False
-    if not any(x in blob for x in ("india", "indian", "₹", "inr")):
+
+    dt = article_date(html)
+    if not dt:
         return False
-    return True
+
+    return start <= dt <= end
 
 
-def rss_candidates(source, domains):
-    html = get(source)
+def model_from_ndtv(title, brand):
+    title = clean(title)
+    title = re.sub(
+        r"\b(launched|launches|launch|introduced|unveiled|debuts|announced)\b.*$",
+        "",
+        title,
+        flags=re.I,
+    )
+    title = re.sub(r"\s+in India.*$", "", title, flags=re.I)
+    title = re.sub(r"\s+with .*?:.*$", "", title, flags=re.I)
+    title = re.sub(r"\s*[-–—:]\s*$", "", title).strip()
+
+    return title
+
+
+def official_search(model, brand, domains):
+    """
+    Search-engine routing is used only to locate the official domain.
+    Product/launch data is read only from the official domain.
+    """
+    q = quote_plus(f'site:{domains[0]} "{model}" India smartphone')
+    url = "https://www.google.com/search?q=" + q
+
+    html = get_html(url)
     if not html:
-        return []
+        return ""
+
     soup = BeautifulSoup(html, "html.parser")
-    feeds = []
-
-    for link in soup.find_all("link"):
-        rel = " ".join(link.get("rel", [])).lower()
-        typ = (link.get("type") or "").lower()
-        href = link.get("href")
-        if href and "alternate" in rel and any(x in typ for x in ("rss", "atom", "xml")):
-            u = norm(href, source)
-            if official(u, domains):
-                feeds.append(u)
-
-    rows = []
-    for feed in dict.fromkeys(feeds):
-        try:
-            p = feedparser.parse(feed)
-            for e in p.entries[:15]:
-                u, title = e.get("link"), clean(e.get("title", ""))
-                q = e.get("published_parsed") or e.get("updated_parsed")
-                if not u or not official(u, domains):
-                    continue
-                dt = datetime(*q[:6], tzinfo=timezone.utc).astimezone(IST) if q else None
-                rows.append((u, title, dt))
-        except Exception:
-            pass
-    return rows
-
-
-def html_candidates(source, domains):
-    html = get(source)
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    rows, seen = [], set()
 
     for a in soup.find_all("a", href=True):
-        u = norm(a["href"], source)
+        u = normalize_url(a["href"], url)
+        if same_domain(u, domains):
+            low = u.lower()
+            if any(x in low for x in ("phone", "smartphone", "mobile", "product", "galaxy", "iphone")):
+                return u
+
+    return ""
+
+
+def official_page_is_india(url):
+    low = url.lower()
+    return any(x in low for x in ("/in/", "india", "in."))
+
+
+def official_launch_confirmed(model, brand, domains, ndtv_date):
+    """
+    Search official domain for the model and require India/launch wording.
+    """
+    q = quote_plus(f'site:{domains[0]} "{model}" launched India')
+    html = get_html("https://www.google.com/search?q=" + q)
+
+    if not html:
+        return "", ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    for a in soup.find_all("a", href=True):
+        u = normalize_url(a["href"])
+        if not same_domain(u, domains):
+            continue
+
         text = clean(a.get_text(" ", strip=True))
         blob = (text + " " + u).lower()
 
-        if u in seen or not official(u, domains) or u.rstrip("/") == source.rstrip("/"):
-            continue
-        if not any(x in blob for x in SMART):
+        if not official_page_is_india(u):
             continue
 
-        seen.add(u)
-        rows.append((u, text, None))
-        if len(rows) >= 12:
-            break
-    return rows
+        if any(x in blob for x in ("launch", "available", "india", "product", "phone")):
+            page_html = get_html(u)
+            if not page_html:
+                continue
+
+            body = clean(BeautifulSoup(page_html, "html.parser").get_text(" ", strip=True))
+            body_low = body.lower()
+
+            if model.lower() not in body_low:
+                continue
+
+            if "india" not in body_low and not official_page_is_india(u):
+                continue
+
+            return u, page_html
+
+    return "", ""
 
 
-def rendered_candidates(page, source, domains):
-    try:
-        page.goto(source, wait_until="domcontentloaded", timeout=15000)
-        page.wait_for_timeout(1800)
-        links = page.locator("a[href]").evaluate_all(
-            """as => as.map(a => ({href:a.href||'',text:(a.innerText||a.textContent||'').trim()}))"""
-        )
-    except Exception:
-        return []
-
-    rows, seen = [], set()
-    for item in links:
-        u = norm(item.get("href", ""), source)
-        text = clean(item.get("text", ""))
-        blob = (text + " " + u).lower()
-
-        if not u or u in seen or not official(u, domains) or u.rstrip("/") == source.rstrip("/"):
-            continue
-        if not any(x in blob for x in SMART):
-            continue
-
-        seen.add(u)
-        rows.append((u, text, None))
-        if len(rows) >= 12:
-            break
-    return rows
-
-
-def google_news_candidates(brand, domains):
-    # Discovery fallback only. It is never accepted as launch proof.
-    query = f'"{brand}" smartphone India (launched OR launch OR introduced OR unveiled OR available)'
-    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
-    rows = []
-    try:
-        p = feedparser.parse(url)
-        for e in p.entries[:10]:
-            u, title = e.get("link"), clean(e.get("title", ""))
-            q = e.get("published_parsed") or e.get("updated_parsed")
-            dt = datetime(*q[:6], tzinfo=timezone.utc).astimezone(IST) if q else None
-            if u:
-                rows.append((u, title, dt))
-    except Exception:
-        pass
-    return rows
-
-
-def discover(brand, cfg, source_page=None):
-    """
-    FAST DISCOVERY
-    - Official India RSS/Atom + lightweight official HTML links.
-    - Google News is only a small fallback.
-    - Never uses Playwright for discovery.
-    """
-    rows = []
-
-    for source in cfg["sources"]:
-        rows += rss_candidates(source, cfg["domains"])
-        rows += html_candidates(source, cfg["domains"])
-
-    if len(rows) < 3:
-        rows += google_news_candidates(brand, cfg["domains"])
-
-    unique = {}
-    for u, title, dt in rows:
-        if u and u not in unique:
-            unique[u] = (title, dt)
-
-    result = [(u, t, d) for u, (t, d) in unique.items()]
-    result.sort(
-        key=lambda x: x[2] or datetime.min.replace(tzinfo=IST),
-        reverse=True,
-    )
-    return result[:8]
-
-
-def product_name(title, brand):
-    x = clean(title)
-    x = re.sub(r"^\s*(?:press release|update|quick read|photos)\s*[:\-]?\s*", "", x, flags=re.I)
-    x = re.split(
-        r"\s+(?:launched|launches|launch|introduced|unveiled|debuts|announces|announced)\b",
-        x, maxsplit=1, flags=re.I
-    )[0]
-    x = re.sub(r"\s*[-–—:]\s*.*$", "", x).strip()
-    if x.lower().startswith(brand.lower() + " "):
-        x = x[len(brand):].strip()
-    return x or "New Smartphone"
-
-
-def description(html, name):
+def product_name_from_official(html, fallback):
     soup = BeautifulSoup(html, "html.parser")
+
+    for selector in ("h1",):
+        tag = soup.select_one(selector)
+        if tag:
+            value = clean(tag.get_text(" ", strip=True))
+            if 2 <= len(value) <= 120:
+                return value
+
     for attrs in (
-        {"property": "og:description"},
+        {"property": "og:title"},
+        {"name": "twitter:title"},
+    ):
+        m = soup.find("meta", attrs=attrs)
+        if m and m.get("content"):
+            value = clean(m["content"])
+            value = re.sub(r"\s*[-|]\s*(Official.*|Buy.*|India.*)$", "", value, flags=re.I)
+            if len(value) >= 2:
+                return value
+
+    return clean(fallback)
+
+
+def official_description(html, model):
+    soup = BeautifulSoup(html, "html.parser")
+
+    for attrs in (
         {"name": "description"},
+        {"property": "og:description"},
         {"name": "twitter:description"},
     ):
         m = soup.find("meta", attrs=attrs)
-        if m and m.get("content") and len(m["content"]) >= 40:
-            return clean(m["content"])[:2000]
+        if m and m.get("content"):
+            text = clean(m["content"])
+            if len(text) >= 60:
+                return text[:2000]
 
-    for p in soup.find_all("p"):
-        txt = clean(p.get_text(" ", strip=True))
-        if 80 <= len(txt) <= 2000:
-            return txt
-    return f"{name} smartphone launched in India."
+    paragraphs = []
+    for p in soup.find_all(["p", "li"]):
+        text = clean(p.get_text(" ", strip=True))
+        low = text.lower()
+
+        if len(text) < 60 or len(text) > 1200:
+            continue
+        if model.lower() not in low and "smartphone" not in low and "phone" not in low:
+            continue
+        paragraphs.append(text)
+
+    if paragraphs:
+        return " ".join(paragraphs[:4])[:2000]
+
+    return ""
 
 
-def variants(page):
+def normalize_capacity(value):
+    value = clean(value).upper().replace(" ", "")
+    return value
+
+
+def extract_variants(html, model):
+    """
+    STRICT RULE:
+    A row is created only when Color + Storage + RAM can be mapped
+    to the same explicit variant. No Cartesian product.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = clean(soup.get_text(" ", strip=True))
+
+    found = []
+
+    # 1. Structured JSON / HTML text containing explicit RAM + storage.
+    # Common forms: 8GB RAM / 256GB, 12GB+256GB, 8 GB + 128 GB.
+    pattern = re.compile(
+        r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*(?:\+|/|\||,|with)\s*"
+        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
+        re.I
+    )
+
+    pairs = []
+    for m in pattern.finditer(text):
+        ram = f"{m.group('ram')} GB"
+        storage = f"{m.group('storage')} {m.group('unit').upper()}"
+        pair = (ram, storage)
+        if pair not in pairs:
+            pairs.append(pair)
+
+    # 2. Explicit variant blocks. We only accept a color when the same
+    # small block contains the RAM/storage pair.
+    blocks = soup.find_all(["li", "div", "section", "article", "label", "option"])
+
+    color_re = re.compile(
+        r"(?:colour|color|colourway|colorway)\s*[:\-]?\s*"
+        r"([A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})",
+        re.I
+    )
+
+    for block in blocks:
+        block_text = clean(block.get_text(" ", strip=True))
+        if len(block_text) > 500:
+            continue
+
+        pm = pattern.search(block_text)
+        cm = color_re.search(block_text)
+
+        if pm and cm:
+            ram = f"{pm.group('ram')} GB"
+            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
+            color = clean(cm.group(1))
+
+            # Remove obvious trailing labels.
+            color = re.split(
+                r"\s+(?:ram|storage|memory|price|₹|\|)\b",
+                color,
+                flags=re.I
+            )[0].strip()
+
+            item = (color, storage, ram)
+            if item not in found:
+                found.append(item)
+
+    # 3. Common product JSON-LD / data attributes.
+    for tag in soup.find_all(["script"]):
+        raw = tag.string or tag.get_text()
+        if not raw or len(raw) > 500000:
+            continue
+
+        for pm in pattern.finditer(raw):
+            ram = f"{pm.group('ram')} GB"
+            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
+
+            before = raw[max(0, pm.start() - 1000):pm.start()]
+            after = raw[pm.end():pm.end() + 1000]
+            nearby = before + " " + after
+
+            cm = color_re.search(nearby)
+            if cm:
+                color = clean(cm.group(1))
+                item = (color, storage, ram)
+                if item not in found:
+                    found.append(item)
+
+    # Deduplicate, normalize, and reject junk colors.
+    clean_found = []
+    bad_colors = {
+        "black", "white", "blue", "green", "red", "silver",
+        "grey", "gray", "gold", "pink", "purple"
+    }
+
+    for color, storage, ram in found:
+        color = clean(color)
+        storage = normalize_capacity(storage)
+        ram = normalize_capacity(ram)
+
+        if len(color) < 2 or len(color) > 45:
+            continue
+
+        if storage not in [x for x in (storage,)]:
+            continue
+
+        # Do not reject generic color names: official pages may legitimately
+        # use them. Only reject obvious UI words.
+        if color.lower() in {"select", "choose", "available", "variant", "color"}:
+            continue
+
+        item = (color, storage, ram)
+        if item not in clean_found:
+            clean_found.append(item)
+
+    return clean_found
+
+
+def official_images(html):
+    soup = BeautifulSoup(html, "html.parser")
     out = []
 
-    try:
-        elements = page.locator("[data-model-code]").all()
-    except Exception:
-        elements = []
+    for tag in soup.find_all(["meta", "img", "source"]):
+        url = ""
 
-    for e in elements:
-        try:
-            text = clean(e.inner_text())
+        if tag.name == "meta":
+            if tag.get("property") in ("og:image", "twitter:image"):
+                url = tag.get("content", "")
+        elif tag.name == "img":
+            url = tag.get("src") or tag.get("data-src") or tag.get("data-lazy-src") or ""
+        else:
+            url = tag.get("srcset", "").split(",")[0].strip().split(" ")[0]
 
-            c = re.search(r"(?:color|colour)\s*:\s*([^|]+)", text, re.I)
-            q = re.search(r"(\d+\s*(?:GB|TB))\s*\|\s*(\d+\s*GB)", text, re.I)
+        url = normalize_url(url)
 
-            if c and q:
-                value = (c.group(1).strip(), q.group(1).strip(), q.group(2).strip())
+        if not url.startswith("http"):
+            continue
 
-                if value not in out:
-                    out.append(value)
+        low = url.lower()
 
-        except Exception:
-            pass
+        if any(x in low for x in (
+            "logo", "icon", "favicon", "sprite", "swatch",
+            "flag", "avatar", "banner", "tracking"
+        )):
+            continue
 
-    if out:
-        return out
+        if url not in out:
+            out.append(url)
 
-    return []
-
-    # Apple iPhone 18 Pro Max fallback
-    try:
-        text = clean(page.locator("body").inner_text()).lower()
-        url = str(page.url).lower()
-
-        if "iphone 18 pro max" in text or "iphone-18-pro-max" in url:
-            colors = [
-                "Black",
-                "Silver",
-                "Glacier",
-                "Burgundy"
-            ]
-
-            storage = [
-                "256 GB",
-                "512 GB",
-                "1 TB",
-                "2 TB"
-            ]
-
-            for color in colors:
-                for capacity in storage:
-                    value = (color, capacity, "12 GB")
-
-                    if value not in out:
-                        out.append(value)
-
-    except Exception:
-        pass
-
-    return out
-
-    pairs = re.findall(r"(\d+\s*(?:GB|TB))\s*[|｜/]\s*(\d+\s*GB)", body, re.I)
-    colors = []
-    for m in re.finditer(r"(?:colour|color)\s*:\s*([A-Za-z][A-Za-z0-9 &'’\-]{2,40})", body, re.I):
-        c = m.group(1).strip()
-        if c.lower() not in [x.lower() for x in colors]:
-            colors.append(c)
-
-    return [(colors[0], pairs[0][0], pairs[0][1])] if len(pairs) == 1 and len(colors) == 1 else []
-
-
-def images(page):
-    try:
-        data = page.locator("img").evaluate_all(
-            """imgs => imgs.map(i => ({s:i.currentSrc||i.src||'',w:i.naturalWidth||0,h:i.naturalHeight||0}))"""
-        )
-    except Exception:
-        return []
-
-    out = []
-    for x in data:
-        u, low = x["s"], x["s"].lower()
-        if (
-            u and x["w"] >= 400 and x["h"] >= 400
-            and not any(z in low for z in ("logo", "icon", "favicon", "swatch", "color_", "colour_", "flag", "avatar"))
-            and u not in out
-        ):
-            out.append(u)
         if len(out) >= 4:
             break
+
     return out
 
 
-def marketplace_support(page, brand, model):
-    result = {"description": "", "images": []}
-    q = quote_plus(f"{brand} {model} smartphone")
-
-    for url in (
-        f"https://www.amazon.in/s?k={q}",
-        f"https://www.flipkart.com/search?q={q}",
-    ):
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=12000)
-            page.wait_for_timeout(700)
-
-            if not result["description"]:
-                text = clean(page.locator("body").inner_text())
-                if len(text) >= 80:
-                    result["description"] = text[:1000]
-
-            data = page.locator("img").evaluate_all(
-                """imgs => imgs.map(i => ({s:i.currentSrc||i.src||'',w:i.naturalWidth||0,h:i.naturalHeight||0,alt:i.alt||''}))"""
-            )
-            for x in data:
-                u, low = x["s"], x["s"].lower()
-                if (
-                    u and x["w"] >= 300 and x["h"] >= 300
-                    and not any(z in low for z in ("logo", "icon", "favicon", "banner", "sprite"))
-                    and u not in result["images"]
-                ):
-                    result["images"].append(u)
-                if len(result["images"]) >= 4:
-                    break
-
-            if result["description"] or result["images"]:
-                break
-        except Exception:
-            pass
-
-    return result
-
-
-def best_product_url(article_url, html, domains):
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        u = norm(a["href"], article_url)
-        if official(u, domains):
-            blob = (clean(a.get_text(" ", strip=True)) + " " + u).lower()
-            if any(x in blob for x in SMART):
-                return u
-    return article_url
+def backup_excel():
+    stamp = now().strftime("%Y%m%d_%H%M%S")
+    backup = XLSX.with_name(f"{XLSX.stem}_backup_{stamp}{XLSX.suffix}")
+    shutil.copy2(XLSX, backup)
+    print("Backup:", backup.name)
 
 
 def main():
     print("=" * 70)
-    print("RETAILIX SMARTPHONE AUTOMATION - FINAL CLOUD VERSION")
-    print("OFFICIAL INDIA VERIFICATION + AMAZON/FLIPKART SUPPORT")
+    print("RETAILIX DAILY SMARTPHONE AUTOMATION")
+    print("NDTV MOBILE DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION")
     print("=" * 70)
 
     if not XLSX.exists():
@@ -538,169 +562,161 @@ def main():
         raise RuntimeError("RetailiX template headers do not match expected 20 columns.")
 
     cols = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-    existing = set()
 
+    existing = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
         existing.add(tuple(
             str(row[cols[k] - 1] or "").strip().lower()
-            for k in ("productName", "brandName", "variant_Color", "variant_Storage", "variant_RAM")
+            for k in (
+                "productName", "brandName",
+                "variant_Color", "variant_Storage", "variant_RAM"
+            )
         ))
 
-    start = datetime(2026, 9, 18, 0, 0, tzinfo=IST)
-    end = datetime(2026, 9, 19, 0, 0, tzinfo=IST)
+    end = now()
+    start = end - timedelta(hours=24)
+
     print(f"Window: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    products = []
+    candidates = ndtv_candidates()
+    print("NDTV candidates found:", len(candidates))
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=HEAD["User-Agent"],
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
+    # Keep only the ten requested brands.
+    grouped = {brand: [] for brand in BRANDS}
 
-        product_page = context.new_page()
-        marketplace_page = context.new_page()
+    for url, title in candidates:
+        brand = candidate_brand(title)
+        if brand and url not in [x[0] for x in grouped[brand]]:
+            grouped[brand].append((url, title))
 
-        try:
-            for brand, cfg in BRANDS.items():
-                print("\nChecking:", brand)
-                candidates = discover(brand, cfg)
+    additions = []
 
-                candidates.sort(
-                    key=lambda x: x[2] or datetime.min.replace(tzinfo=IST),
-                    reverse=True,
-                )
+    for brand, urls in grouped.items():
+        print("\nChecking:", brand)
 
-                found = False
-                checked = 0
-                unknown_dates = 0
+        if not urls:
+            print("  No NDTV candidate.")
+            continue
 
-                for candidate_url, hint_title, candidate_dt in candidates:
-                    # RSS dates are already known. Skip old items BEFORE
-                    # downloading their pages.
-                    if candidate_dt is not None:
-                        if candidate_dt < start or candidate_dt > end:
-                            continue
-                    else:
-                        # Only inspect a couple of candidates whose date is
-                        # unknown; this prevents a slow newsroom crawl.
-                        if unknown_dates >= 2:
-                            continue
-                        unknown_dates += 1
+        found_model = False
 
-                    if checked >= 6:
-                        break
-                    checked += 1
+        for ndtv_url, ndtv_title in urls[:12]:
+            if found_model:
+                break
 
-                    html = get(candidate_url)
-                    if not html:
-                        continue
+            html = get_html(ndtv_url)
+            if not html:
+                continue
 
-                    title = title_of(html, hint_title)
-                    dt = candidate_dt or article_date(html)
+            if not qualifying_ndtv(ndtv_title, html, brand, start, end):
+                continue
 
-                    if not qualifying(title, html, brand, dt, start, end):
-                        continue
+            ndtv_dt = article_date(html)
+            model_hint = model_from_ndtv(ndtv_title, brand)
 
-                    print("  VERIFIED:", title)
-                    print("  Date:", dt.isoformat())
-                    print("  Official:", candidate_url)
+            print("  NDTV:", ndtv_title)
+            print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
 
-                    product_url = best_product_url(candidate_url, html, cfg["domains"])
+            # Official launch confirmation + official product page.
+            domains = BRANDS[brand]
 
-                    try:
-                        product_page.goto(product_url, wait_until="domcontentloaded", timeout=20000)
-                        product_page.wait_for_timeout(1200)
+            official_url, official_html = official_launch_confirmed(
+                model_hint, brand, domains, ndtv_dt
+            )
 
-                        vs = variants(product_page)
-                        if not vs:
-                            print("  SKIPPED: exact Color + Storage + RAM mapping not verified.")
-                            continue
+            if not official_url or not official_html:
+                print("  SKIPPED: official India confirmation not found.")
+                continue
 
-                        name = product_name(title, brand)
-                        desc = description(html, name)
-                        img = images(product_page)
+            print("  Official:", official_url)
 
-                        if not img or len(desc) < 80:
-                            support = marketplace_support(marketplace_page, brand, name)
-                            if not img:
-                                img = support["images"]
-                            if len(desc) < 80 and support["description"]:
-                                desc = support["description"]
+            name = product_name_from_official(official_html, model_hint)
+            description = official_description(official_html, name)
 
-                        products.append({
-                            "name": name,
-                            "brand": brand,
-                            "description": desc,
-                            "variants": vs,
-                            "images": img,
-                        })
+            variants = extract_variants(official_html, name)
 
-                        print("  Exact variants:", len(vs))
-                        print("  Images:", len(img))
-                        found = True
-                        break
+            if not variants:
+                print("  SKIPPED: exact Color + Storage + RAM mapping not verified.")
+                continue
 
-                    except Exception as exc:
-                        print("  Product page skipped:", type(exc).__name__)
+            images = official_images(official_html)
 
-                if not found:
-                    print("  No qualifying launch in previous 24 hours.")
+            if not images:
+                print("  SKIPPED: official product image not found.")
+                continue
 
-        finally:
-            for p in (product_page, marketplace_page):
-                try:
-                    p.close()
-                except Exception:
-                    pass
-            browser.close()
-
-    added = skipped = 0
-
-    if products:
-        backup = XLSX.with_name(
-            XLSX.stem + "_backup_" + now().strftime("%Y%m%d_%H%M%S") + XLSX.suffix
-        )
-        shutil.copy2(XLSX, backup)
-        print("\nBackup:", backup.name)
-
-        for p in products:
-            for color, storage, ram in p["variants"]:
+            for color, storage, ram in variants:
                 key = (
-                    p["name"].lower(), p["brand"].lower(),
-                    color.lower(), storage.lower(), ram.lower()
+                    name.strip().lower(),
+                    brand.lower(),
+                    color.strip().lower(),
+                    storage.strip().lower(),
+                    ram.strip().lower(),
                 )
 
                 if key in existing:
-                    skipped += 1
                     continue
 
-                imgs = p["images"]
-                ws.append([
-                    p["name"], p["brand"], "Electronics", "Accessories", "piece",
-                    "NO TAX APPLIED", "NODISCOUNT0", "1 Year Warranty",
-                    p["description"][:500], p["description"][:2000],
-                    "true", "false", color, storage, ram,
-                    imgs[0] if len(imgs) > 0 else "", "true",
-                    imgs[1] if len(imgs) > 1 else "",
-                    imgs[2] if len(imgs) > 2 else "",
-                    imgs[3] if len(imgs) > 3 else "",
-                ])
+                additions.append({
+                    "name": name,
+                    "brand": brand,
+                    "short": description[:500],
+                    "long": description[:2000],
+                    "color": color,
+                    "storage": storage,
+                    "ram": ram,
+                    "images": images,
+                })
+
                 existing.add(key)
-                added += 1
 
-        wb.save(XLSX)
-    else:
-        print("\nNo qualifying smartphone launches. Excel was NOT modified.")
+            print("  Product:", name)
+            print("  Exact variants:", len(variants))
+            print("  Official images:", len(images))
+            found_model = True
 
-    print("\n" + "=" * 70)
+        if not found_model:
+            print("  No qualifying verified launch.")
+
+    if not additions:
+        print("\nNo new verified smartphones to add.")
+        print("AUTOMATION COMPLETED")
+        return
+
+    backup_excel()
+
+    for p in additions:
+        imgs = p["images"]
+
+        ws.append([
+            p["name"],
+            p["brand"],
+            "Electronics",
+            "Accessories",
+            "piece",
+            "NO TAX APPLIED",
+            "NODISCOUNT0",
+            "1 Year Warranty",
+            p["short"],
+            p["long"],
+            "true",
+            "false",
+            p["color"],
+            p["storage"],
+            p["ram"],
+            imgs[0] if len(imgs) > 0 else "",
+            "true",
+            imgs[1] if len(imgs) > 1 else "",
+            imgs[2] if len(imgs) > 2 else "",
+            imgs[3] if len(imgs) > 3 else "",
+        ])
+
+    wb.save(XLSX)
+
+    print("\nRows added:", len(additions))
+    print("Rows skipped: verified duplicates / incomplete official data")
     print("AUTOMATION COMPLETED")
-    print("Rows added:", added)
-    print("Rows skipped:", skipped)
-    print("=" * 70)
 
 
 if __name__ == "__main__":
