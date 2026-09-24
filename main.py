@@ -33,6 +33,20 @@ BRANDS = {
 }
 
 
+BRAND_ALIASES = {
+    "APPLE": ["Apple", "iPhone"],
+    "INFINIX": ["Infinix"],
+    "MOTOROLA": ["Motorola", "Moto"],
+    "ONEPLUS": ["OnePlus"],
+    "OPPO": ["OPPO"],
+    "POCO": ["POCO"],
+    "REDMI": ["Redmi", "Xiaomi"],
+    "REALME": ["realme"],
+    "SAMSUNG": ["Samsung", "Galaxy"],
+    "VIVO": ["vivo"],
+}
+
+
 BRAND_HOMES = {
     "APPLE": "https://www.apple.com/in/",
     "INFINIX": "https://infinixmobiles.in/",
@@ -779,7 +793,7 @@ def backup_excel():
 def main():
     print("=" * 70)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION")
-    print("NDTV MOBILE DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION ONLY")
+    print("NDTV + GOOGLE NEWS DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION ONLY")
     print("=" * 70)
 
     if not XLSX.exists():
