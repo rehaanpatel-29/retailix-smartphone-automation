@@ -3,7 +3,7 @@ import re
 import time
 import shutil
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, quote_plus, urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -32,10 +32,10 @@ BRANDS = {
 }
 
 NDTV_URLS = [
-    "https://www.ndtv.com/topic/mobile-phones",
     "https://www.ndtv.com/topic/smartphones",
+    "https://www.ndtv.com/topic/mobile-phones",
     "https://www.ndtv.com/topic/smartphone",
-    "https://www.ndtv.com/topic/launches",
+    "https://www.ndtv.com/topic/phones",
 ]
 
 HEADERS = [
@@ -158,9 +158,14 @@ def article_date(html):
 def ndtv_candidates():
     """
     NDTV is the only discovery layer.
-    We inspect its mobile-phone/launch topic pages and collect article links.
+
+    Important: do NOT require launch wording in the headline. NDTV launch
+    stories sometimes put the actual launch wording in the article body.
+    We collect recent smartphone/phone articles first, then qualifying_ndtv()
+    checks the full article for launch wording and the exact 24-hour window.
     """
     out = {}
+
     for base in NDTV_URLS:
         html = get_html(base)
         if not html:
@@ -177,19 +182,26 @@ def ndtv_candidates():
             if len(title) < 15:
                 continue
 
+            path = urlparse(url).path.lower()
+            if not (path.startswith("/technology/") or path.startswith("/tech/")):
+                continue
+
             blob = title.lower()
             if not any(x in blob for x in SMART_WORDS):
                 continue
 
-            # Keep only useful launch-looking mobile stories.
-            # Article verification later is stricter.
-            if not any(x in blob for x in LAUNCH_WORDS):
+            # Avoid obvious non-launch content early, but do not reject a
+            # story merely because the headline lacks the word "launch".
+            if any(x in blob for x in (
+                "review", "vs", "versus", "comparison", "price drop",
+                "discount", "deal", "offers", "best phones", "top phones",
+                "how to", "tips", "wallpaper", "case", "cover"
+            )):
                 continue
 
             out[url] = title
 
     return [(u, t) for u, t in out.items()]
-
 
 def candidate_brand(title):
     low = title.lower()
@@ -214,9 +226,13 @@ def candidate_brand(title):
 
 
 def qualifying_ndtv(title, html, brand, start, end):
-    low = (title + " " + BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:8000]).lower()
+    soup = BeautifulSoup(html, "html.parser")
+    body = clean(soup.get_text(" ", strip=True))
+    title_low = title.lower()
+    body_low = body[:12000].lower()
 
-    if any(x in low for x in BAD_WORDS):
+    # Reject obvious non-launch stories based primarily on the headline.
+    if any(x in title_low for x in BAD_WORDS):
         return False
 
     aliases = {
@@ -232,10 +248,11 @@ def qualifying_ndtv(title, html, brand, start, end):
         "VIVO": ("vivo",),
     }
 
-    if not any(x in low for x in aliases[brand]):
+    if not any(x in (title_low + " " + body_low) for x in aliases[brand]):
         return False
 
-    if not any(x in low for x in LAUNCH_WORDS):
+    # Launch language may appear in the article body rather than the title.
+    if not any(x in (title_low + " " + body_low) for x in LAUNCH_WORDS):
         return False
 
     dt = article_date(html)
@@ -243,7 +260,6 @@ def qualifying_ndtv(title, html, brand, start, end):
         return False
 
     return start <= dt <= end
-
 
 def model_from_ndtv(title, brand):
     title = clean(title)
@@ -360,48 +376,6 @@ def official_launch_confirmed(model, brand, domains, ndtv_html):
 def official_page_is_india(url):
     low = url.lower()
     return any(x in low for x in ("/in/", "india", "in."))
-
-
-def official_launch_confirmed(model, brand, domains, ndtv_date):
-    """
-    Search official domain for the model and require India/launch wording.
-    """
-    q = quote_plus(f'site:{domains[0]} "{model}" launched India')
-    html = get_html("https://www.google.com/search?q=" + q)
-
-    if not html:
-        return "", ""
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    for a in soup.find_all("a", href=True):
-        u = normalize_url(a["href"])
-        if not same_domain(u, domains):
-            continue
-
-        text = clean(a.get_text(" ", strip=True))
-        blob = (text + " " + u).lower()
-
-        if not official_page_is_india(u):
-            continue
-
-        if any(x in blob for x in ("launch", "available", "india", "product", "phone")):
-            page_html = get_html(u)
-            if not page_html:
-                continue
-
-            body = clean(BeautifulSoup(page_html, "html.parser").get_text(" ", strip=True))
-            body_low = body.lower()
-
-            if model.lower() not in body_low:
-                continue
-
-            if "india" not in body_low and not official_page_is_india(u):
-                continue
-
-            return u, page_html
-
-    return "", ""
 
 
 def product_name_from_official(html, fallback):
