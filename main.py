@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import urllib.parse
 import time
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -206,6 +207,61 @@ def _collect_ndtv_links(html, base):
         out[url] = title
 
     return out
+
+
+
+def google_news_candidates():
+    """
+    Google News is discovery-only.
+    It searches the 10 allowed brands + India/launch terms over the last 24h.
+    Verification/data still comes only from official India brand websites.
+    """
+    out = {}
+    search_terms = [
+        '"launched" smartphone India',
+        '"launch" smartphone India',
+        '"launched in India" smartphone',
+        '"launched in India" phone',
+        '"India launch" smartphone',
+        '"India launch" phone',
+    ]
+
+    for brand in BRANDS:
+        brand_terms = [brand] + BRAND_ALIASES.get(brand, [])
+        brand_query = "(" + " OR ".join(brand_terms) + ")"
+        for term in search_terms:
+            query = f"{brand_query} {term} when:1d"
+            url = (
+                "https://news.google.com/rss/search?"
+                + urllib.parse.urlencode({
+                    "q": query,
+                    "hl": "en-IN",
+                    "gl": "IN",
+                    "ceid": "IN:en",
+                })
+            )
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:30]:
+                    title = clean(getattr(entry, "title", ""))
+                    link = getattr(entry, "link", "")
+                    published = getattr(entry, "published", "")
+                    if not title or not link:
+                        continue
+
+                    low = title.lower()
+                    if not any(a.lower() in low for a in brand_terms):
+                        continue
+                    if not any(w in low for w in SMART_WORDS):
+                        continue
+                    if not any(w in low for w in LAUNCH_WORDS):
+                        continue
+
+                    out[link] = title
+            except Exception:
+                continue
+
+    return list(out.items())
 
 
 def ndtv_candidates():
@@ -771,7 +827,7 @@ def main():
         print("\nChecking:", brand)
 
         if not urls:
-            print("  No NDTV candidate.")
+            print("  No NDTV/Google News candidate.")
             continue
 
         found_model = False
