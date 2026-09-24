@@ -225,6 +225,28 @@ def _collect_ndtv_links(html, base):
 
 
 
+
+def resolve_google_news_url(url):
+    """Turn a Google News RSS article URL into the original publisher URL."""
+    if not url or "news.google.com" not in url:
+        return url
+
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+            allow_redirects=True,
+        )
+        final_url = r.url
+        if final_url and "news.google.com" not in final_url:
+            return final_url
+    except Exception:
+        pass
+
+    return url
+
+
 def google_news_candidates():
     """
     Google News is discovery-only.
@@ -272,7 +294,8 @@ def google_news_candidates():
                     if not any(w in low for w in LAUNCH_WORDS):
                         continue
 
-                    out[link] = title
+                    source_url = resolve_google_news_url(link)
+                    out[source_url] = title
             except Exception:
                 continue
 
@@ -439,6 +462,51 @@ def official_link_from_ndtv(ndtv_html, domains, model):
     return candidates[0][1] if candidates else ""
 
 
+
+def official_direct_product_urls(model, brand):
+    """Return conservative official India URL candidates for known site patterns."""
+    slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+    compact = re.sub(r"[^a-z0-9]+", "", model.lower())
+
+    patterns = {
+        "ONEPLUS": [
+            f"https://www.oneplus.in/{slug}",
+            f"https://www.oneplus.in/{compact}",
+        ],
+        "REALME": [
+            f"https://www.realme.com/in/realme-{slug}",
+            f"https://www.realme.com/in/{slug}",
+        ],
+        "MOTOROLA": [
+            f"https://www.motorola.in/smartphones-{slug}",
+            f"https://www.motorola.in/{slug}",
+        ],
+        "SAMSUNG": [
+            f"https://www.samsung.com/in/smartphones/{slug}/",
+        ],
+        "OPPO": [
+            f"https://www.oppo.com/in/smartphones/series-{slug}/",
+            f"https://www.oppo.com/in/smartphones/{slug}/",
+        ],
+        "VIVO": [
+            f"https://www.vivo.com/in/products/{slug}",
+        ],
+        "INFINIX": [
+            f"https://infinixmobility.com/{slug}",
+        ],
+        "APPLE": [
+            f"https://www.apple.com/in/{slug}/",
+        ],
+        "POCO": [
+            f"https://www.mi.com/in/product/{slug}/",
+        ],
+        "REDMI": [
+            f"https://www.mi.com/in/product/{slug}/",
+        ],
+    }
+    return patterns.get(brand, [])
+
+
 def official_product_url_from_home(model, brand, domains):
     """Find a model page by crawling only the official India brand site."""
     home = BRAND_HOMES.get(brand, "")
@@ -519,6 +587,24 @@ def official_launch_confirmed(model, brand, domains, ndtv_html):
 
     if not product_url:
         product_url = official_product_url_from_home(model, brand, domains)
+
+    # Last resort: try only deterministic URLs on the official India domain.
+    if not product_url:
+        for direct_url in official_direct_product_urls(model, brand):
+            try:
+                test_html = get_html(direct_url)
+                if test_html:
+                    soup = BeautifulSoup(test_html, "html.parser")
+                    body = clean(soup.get_text(" ", strip=True)).lower()
+                    words = [
+                        w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
+                        if len(w) >= 3
+                    ]
+                    if words and all(w in body for w in words[:2]):
+                        product_url = direct_url
+                        break
+            except Exception:
+                continue
 
     if not product_url:
         return "", ""
@@ -874,7 +960,8 @@ def main():
             ndtv_dt = article_date(html)
             model_hint = model_from_ndtv(ndtv_title, brand)
 
-            print("  NDTV:", ndtv_title)
+            print("  Discovery:", ndtv_title)
+            print("  Source URL:", ndtv_url)
             print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
 
             # Official launch confirmation + official product page.
