@@ -32,6 +32,7 @@ BRANDS = {
 
 NDTV_URLS = [
     "https://www.ndtv.com/topic/mobile-phones",
+    "https://www.ndtv.com/topic/smartphones",
     "https://www.ndtv.com/topic/smartphone",
     "https://www.ndtv.com/topic/launches",
 ]
@@ -258,29 +259,102 @@ def model_from_ndtv(title, brand):
     return title
 
 
-def official_search(model, brand, domains):
+def official_link_from_ndtv(ndtv_html, domains, model):
     """
-    Search-engine routing is used only to locate the official domain.
-    Product/launch data is read only from the official domain.
+    Find an official brand URL directly linked from the NDTV article.
+    No search engine, marketplace, or third-party product source is used.
     """
-    q = quote_plus(f'site:{domains[0]} "{model}" India smartphone')
-    url = "https://www.google.com/search?q=" + q
+    soup = BeautifulSoup(ndtv_html, "html.parser")
+    model_words = {
+        x.lower() for x in re.findall(r"[A-Za-z0-9]+", model)
+        if len(x) >= 2
+    }
 
-    html = get_html(url)
-    if not html:
-        return ""
-
-    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
 
     for a in soup.find_all("a", href=True):
-        u = normalize_url(a["href"], url)
-        if same_domain(u, domains):
-            low = u.lower()
-            if any(x in low for x in ("phone", "smartphone", "mobile", "product", "galaxy", "iphone")):
-                return u
+        u = normalize_url(a["href"], "https://www.ndtv.com/")
+        if not same_domain(u, domains):
+            continue
 
-    return ""
+        text = clean(a.get_text(" ", strip=True))
+        blob = (text + " " + u).lower()
 
+        score = 0
+        if official_page_is_india(u):
+            score += 3
+        if any(x in blob for x in ("phone", "smartphone", "mobile", "product")):
+            score += 2
+
+        for word in model_words:
+            if word in blob:
+                score += 1
+
+        candidates.append((score, u))
+
+    candidates.sort(reverse=True)
+
+    return candidates[0][1] if candidates else ""
+
+
+def official_launch_confirmed(model, brand, domains, ndtv_html):
+    """
+    Verify the launch only on the official brand domain.
+    The official page must contain the model and clear launch/availability
+    language for India. No Google, marketplace, or other tech site is used.
+    """
+    product_url = official_link_from_ndtv(ndtv_html, domains, model)
+
+    if not product_url:
+        return "", ""
+
+    official_html = get_html(product_url)
+    if not official_html:
+        return "", ""
+
+    soup = BeautifulSoup(official_html, "html.parser")
+    body = clean(soup.get_text(" ", strip=True))
+    low = body.lower()
+    model_low = model.lower()
+
+    if model_low not in low:
+        # Try a slightly looser model match using significant words.
+        words = [
+            w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
+            if len(w) >= 3
+        ]
+        if not words or not all(w in low for w in words[:2]):
+            return "", ""
+
+    launch_terms = (
+        "launched in india",
+        "launches in india",
+        "introduced in india",
+        "available in india",
+        "now available in india",
+        "goes on sale in india",
+        "sale begins in india",
+        "available from",
+        "available starting",
+        "available beginning",
+        "launch date",
+    )
+
+    if not any(term in low for term in launch_terms):
+        # Official product pages often state India availability without the
+        # exact phrase above. Accept explicit India + available/launch wording.
+        if "india" not in low:
+            return "", ""
+        if not any(x in low for x in ("launch", "available", "sale")):
+            return "", ""
+
+    if not official_page_is_india(product_url):
+        # Some official India product pages use a global-looking URL.
+        # Require explicit India text on the page in that case.
+        if "india" not in low:
+            return "", ""
+
+    return product_url, official_html
 
 def official_page_is_india(url):
     low = url.lower()
@@ -486,9 +560,6 @@ def extract_variants(html, model):
         if len(color) < 2 or len(color) > 45:
             continue
 
-        if storage not in [x for x in (storage,)]:
-            continue
-
         # Do not reject generic color names: official pages may legitimately
         # use them. Only reject obvious UI words.
         if color.lower() in {"select", "choose", "available", "variant", "color"}:
@@ -548,7 +619,7 @@ def backup_excel():
 def main():
     print("=" * 70)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION")
-    print("NDTV MOBILE DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION")
+    print("NDTV MOBILE DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION ONLY")
     print("=" * 70)
 
     if not XLSX.exists():
@@ -632,7 +703,17 @@ def main():
             print("  Official:", official_url)
 
             name = product_name_from_official(official_html, model_hint)
+
+            # Never use an NDTV article headline as the product name.
+            if name.lower() == ndtv_title.lower():
+                print("  SKIPPED: official page did not provide an exact product name.")
+                continue
+
             description = official_description(official_html, name)
+
+            if len(description) < 60:
+                print("  SKIPPED: official product description not verified.")
+                continue
 
             variants = extract_variants(official_html, name)
 
