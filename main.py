@@ -31,6 +31,20 @@ BRANDS = {
     "VIVO": ["vivo.com"],
 }
 
+
+BRAND_HOMES = {
+    "APPLE": "https://www.apple.com/in/",
+    "INFINIX": "https://infinixmobiles.in/",
+    "MOTOROLA": "https://www.motorola.in/",
+    "ONEPLUS": "https://www.oneplus.in/",
+    "OPPO": "https://www.oppo.com/in/",
+    "POCO": "https://www.mi.com/in/",
+    "REDMI": "https://www.mi.com/in/",
+    "REALME": "https://www.realme.com/in/",
+    "SAMSUNG": "https://www.samsung.com/in/",
+    "VIVO": "https://www.vivo.com/in/",
+}
+
 NDTV_URLS = [
     "https://www.ndtv.com/topic/smartphones",
     "https://www.ndtv.com/topic/mobile-phones",
@@ -155,53 +169,93 @@ def article_date(html):
     return None
 
 
+def _collect_ndtv_links(html, base):
+    """Extract article links from an NDTV topic page."""
+    out = {}
+    soup = BeautifulSoup(html, "html.parser")
+
+    for a in soup.find_all("a", href=True):
+        url = normalize_url(a["href"], base)
+        title = clean(a.get_text(" ", strip=True))
+
+        if not url.startswith("https://www.ndtv.com/"):
+            continue
+        if len(title) < 15:
+            continue
+
+        path = urlparse(url).path.lower()
+        if any(path.startswith(x) for x in (
+            "/topic/", "/video/", "/photos/", "/photo/",
+            "/webstories/", "/web-story/", "/live-updates/"
+        )):
+            continue
+
+        blob = title.lower()
+        if not any(x in blob for x in SMART_WORDS):
+            continue
+
+        # Keep discovery broad. Launch/review/leak filtering happens after
+        # opening the actual NDTV article.
+        if any(x in blob for x in (
+            "review", " vs ", "versus", "comparison", "price drop",
+            "discount", "deal", "offers", "best phones", "top phones",
+            "how to", "tips", "wallpaper", "case", "cover"
+        )):
+            continue
+
+        out[url] = title
+
+    return out
+
+
 def ndtv_candidates():
     """
     NDTV is the only discovery layer.
 
-    Important: do NOT require launch wording in the headline. NDTV launch
-    stories sometimes put the actual launch wording in the article body.
-    We collect recent smartphone/phone articles first, then qualifying_ndtv()
-    checks the full article for launch wording and the exact 24-hour window.
+    First try normal HTTP. If NDTV serves the topic page in a form that does
+    not expose article links to requests (which can happen with bot/CDN
+    handling), fall back to Playwright Chromium. This is still the same NDTV
+    source; no Google, Amazon, Flipkart, or other news site is used.
     """
     out = {}
 
     for base in NDTV_URLS:
         html = get_html(base)
-        if not html:
-            continue
+        if html:
+            out.update(_collect_ndtv_links(html, base))
 
-        soup = BeautifulSoup(html, "html.parser")
+    if out:
+        print(f"NDTV HTTP discovery: {len(out)} article candidates")
+        return list(out.items())
 
-        for a in soup.find_all("a", href=True):
-            url = normalize_url(a["href"], base)
-            title = clean(a.get_text(" ", strip=True))
+    print("NDTV HTTP discovery returned 0 candidates; trying browser discovery...")
 
-            if not url.startswith("https://www.ndtv.com/"):
-                continue
-            if len(title) < 15:
-                continue
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1365, "height": 900},
+            )
 
-            path = urlparse(url).path.lower()
-            if not (path.startswith("/technology/") or path.startswith("/tech/")):
-                continue
+            for base in NDTV_URLS:
+                try:
+                    page.goto(base, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                    html = page.content()
+                    out.update(_collect_ndtv_links(html, base))
+                except Exception as e:
+                    print(f"  Browser discovery failed for {base}: {e}")
 
-            blob = title.lower()
-            if not any(x in blob for x in SMART_WORDS):
-                continue
+            browser.close()
+    except Exception as e:
+        print(f"NDTV browser discovery unavailable: {e}")
 
-            # Avoid obvious non-launch content early, but do not reject a
-            # story merely because the headline lacks the word "launch".
-            if any(x in blob for x in (
-                "review", "vs", "versus", "comparison", "price drop",
-                "discount", "deal", "offers", "best phones", "top phones",
-                "how to", "tips", "wallpaper", "case", "cover"
-            )):
-                continue
-
-            out[url] = title
-
-    return [(u, t) for u, t in out.items()]
+    print(f"NDTV browser discovery: {len(out)} article candidates")
+    return list(out.items())
 
 def candidate_brand(title):
     low = title.lower()
@@ -314,18 +368,103 @@ def official_link_from_ndtv(ndtv_html, domains, model):
     return candidates[0][1] if candidates else ""
 
 
+def official_product_url_from_home(model, brand, domains):
+    """Find a model page by crawling only the official India brand site."""
+    home = BRAND_HOMES.get(brand, "")
+    if not home:
+        return ""
+
+    words = [
+        w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
+        if len(w) >= 2
+    ]
+    if not words:
+        return ""
+
+    def score_link(url, text=""):
+        if not same_domain(url, domains):
+            return -1
+        blob = (url + " " + text).lower()
+        score = 0
+        for w in words:
+            if w in blob:
+                score += 3
+        if any(x in blob for x in ("phone", "smartphone", "mobile", "product")):
+            score += 2
+        if official_page_is_india(url):
+            score += 2
+        return score
+
+    # Fast HTTP crawl first.
+    html = get_html(home)
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        ranked = []
+        for a in soup.find_all("a", href=True):
+            u = normalize_url(a["href"], home)
+            score = score_link(u, clean(a.get_text(" ", strip=True)))
+            if score >= 5:
+                ranked.append((score, u))
+        if ranked:
+            ranked.sort(reverse=True)
+            return ranked[0][1]
+
+    # JS-heavy official sites: use the already-installed Playwright browser.
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                )
+            )
+            page.goto(home, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2500)
+            soup = BeautifulSoup(page.content(), "html.parser")
+            ranked = []
+            for a in soup.find_all("a", href=True):
+                u = normalize_url(a["href"], home)
+                score = score_link(u, clean(a.get_text(" ", strip=True)))
+                if score >= 5:
+                    ranked.append((score, u))
+            browser.close()
+            if ranked:
+                ranked.sort(reverse=True)
+                return ranked[0][1]
+    except Exception:
+        pass
+
+    return ""
+
+
 def official_launch_confirmed(model, brand, domains, ndtv_html):
     """
-    Verify the launch only on the official brand domain.
-    The official page must contain the model and clear launch/availability
-    language for India. No Google, marketplace, or other tech site is used.
+    Verify the launch only on the official India brand domain.
+    First use an official link inside the NDTV article; if NDTV does not
+    provide one, locate the model page by crawling the official India site.
     """
     product_url = official_link_from_ndtv(ndtv_html, domains, model)
+
+    if not product_url:
+        product_url = official_product_url_from_home(model, brand, domains)
 
     if not product_url:
         return "", ""
 
     official_html = get_html(product_url)
+    if not official_html:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                official_html = page.content()
+                browser.close()
+        except Exception:
+            official_html = ""
+
     if not official_html:
         return "", ""
 
@@ -335,7 +474,6 @@ def official_launch_confirmed(model, brand, domains, ndtv_html):
     model_low = model.lower()
 
     if model_low not in low:
-        # Try a slightly looser model match using significant words.
         words = [
             w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
             if len(w) >= 3
@@ -343,33 +481,24 @@ def official_launch_confirmed(model, brand, domains, ndtv_html):
         if not words or not all(w in low for w in words[:2]):
             return "", ""
 
+    # Official product pages commonly prove India availability through
+    # India-specific URLs plus buy/availability language rather than a
+    # literal "launched in India" sentence.
     launch_terms = (
-        "launched in india",
-        "launches in india",
-        "introduced in india",
-        "available in india",
-        "now available in india",
-        "goes on sale in india",
-        "sale begins in india",
-        "available from",
-        "available starting",
-        "available beginning",
-        "launch date",
+        "launched in india", "launches in india", "introduced in india",
+        "available in india", "now available in india",
+        "goes on sale in india", "sale begins in india", "available from",
+        "available starting", "available beginning", "buy now", "add to cart",
+        "out of stock", "notify me"
     )
 
-    if not any(term in low for term in launch_terms):
-        # Official product pages often state India availability without the
-        # exact phrase above. Accept explicit India + available/launch wording.
-        if "india" not in low:
-            return "", ""
-        if not any(x in low for x in ("launch", "available", "sale")):
-            return "", ""
+    has_india = "india" in low or official_page_is_india(product_url)
+    has_launch_signal = any(term in low for term in launch_terms)
+    if not (has_india and has_launch_signal):
+        return "", ""
 
-    if not official_page_is_india(product_url):
-        # Some official India product pages use a global-looking URL.
-        # Require explicit India text on the page in that case.
-        if "india" not in low:
-            return "", ""
+    if not official_page_is_india(product_url) and "india" not in low:
+        return "", ""
 
     return product_url, official_html
 
@@ -668,7 +797,7 @@ def main():
             domains = BRANDS[brand]
 
             official_url, official_html = official_launch_confirmed(
-                model_hint, brand, domains, ndtv_dt
+                model_hint, brand, domains, html
             )
 
             if not official_url or not official_html:
