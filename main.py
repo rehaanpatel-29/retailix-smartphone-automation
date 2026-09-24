@@ -810,8 +810,21 @@ def main():
     print(f"Window: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    candidates = ndtv_candidates()
-    print("NDTV candidates found:", len(candidates))
+    ndtv_results = ndtv_candidates()
+    print("NDTV candidates found:", len(ndtv_results))
+
+    google_results = google_news_candidates()
+    print("Google News candidates found:", len(google_results))
+
+    # Merge NDTV + Google News discovery results.
+    merged = {}
+    for url, title in ndtv_results:
+        merged[url] = title
+    for url, title in google_results:
+        merged.setdefault(url, title)
+
+    candidates = list(merged.items())
+    print("Combined discovery candidates:", len(candidates))
 
     # Keep only the ten requested brands.
     grouped = {brand: [] for brand in BRANDS}
