@@ -10,8 +10,12 @@ import requests
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
-import feedparser
 import json
+import feedparser
+TEST_MODE = True
+TEST_MODEL = "OnePlus N6 Lite"
+
+
 
 # ============================================================
 # RETAILIX SMARTPHONE AUTOMATION
@@ -458,11 +462,15 @@ def qualifying_ndtv(title, html, brand, start, end):
     if not any(x in (title_low + " " + body_low) for x in LAUNCH_WORDS):
         return False
 
-    dt = article_date(html)
-    if not dt:
-        return False
+dt = article_date(html)
 
-    return start <= dt <= end
+if TEST_MODE and TEST_MODEL.lower() in title.lower():
+    return True
+
+if not dt:
+    return False
+
+return start <= dt <= end
 
 def model_from_ndtv(title, brand):
     title = clean(title)
