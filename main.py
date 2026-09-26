@@ -438,7 +438,7 @@ def qualifying_ndtv(title, html, brand, start, end):
     title_low = title.lower()
     body_low = body[:12000].lower()
 
-    # Reject obvious non-launch stories based primarily on the headline.
+    # Reject obvious non-launch stories
     if any(x in title_low for x in BAD_WORDS):
         return False
 
@@ -458,19 +458,21 @@ def qualifying_ndtv(title, html, brand, start, end):
     if not any(x in (title_low + " " + body_low) for x in aliases[brand]):
         return False
 
-    # Launch language may appear in the article body rather than the title.
+    # Launch language must be present
     if not any(x in (title_low + " " + body_low) for x in LAUNCH_WORDS):
         return False
 
-dt = article_date(html)
+    # TEST MODE: allow the known OnePlus N6 Lite through
+    # so we can test the complete official-site pipeline.
+    if TEST_MODE and TEST_MODEL.lower() in title_low:
+        return True
 
-if TEST_MODE and TEST_MODEL.lower() in title.lower():
-    return True
+    dt = article_date(html)
 
-if not dt:
-    return False
+    if not dt:
+        return False
 
-return start <= dt <= end
+    return start <= dt <= end
 
 def model_from_ndtv(title, brand):
     title = clean(title)
