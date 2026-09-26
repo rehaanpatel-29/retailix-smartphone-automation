@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 import feedparser
+import json
 
 # ============================================================
 # RETAILIX SMARTPHONE AUTOMATION
@@ -158,24 +159,78 @@ def parse_date(text):
 def article_date(html):
     soup = BeautifulSoup(html, "html.parser")
 
+    # 1. Standard meta tags
     for attrs in (
         {"property": "article:published_time"},
         {"name": "publish-date"},
+        {"name": "published"},
         {"name": "date"},
+        {"name": "datePublished"},
         {"itemprop": "datePublished"},
+        {"property": "datePublished"},
     ):
         m = soup.find("meta", attrs=attrs)
         if m:
             value = m.get("content") or m.get("datetime")
             if value:
                 try:
-                    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
                     return dt.astimezone(IST)
                 except Exception:
                     d = parse_date(value)
                     if d:
                         return d
 
+    # 2. JSON-LD structured data
+    for script in soup.find_all("script", type="application/ld+json"):
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        items = data if isinstance(data, list) else [data]
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("datePublished"):
+                value = str(item["datePublished"])
+
+                try:
+                    dt = datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
+                    return dt.astimezone(IST)
+                except Exception:
+                    d = parse_date(value)
+                    if d:
+                        return d
+
+            # Some sites put the article inside @graph
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                for obj in graph:
+                    if isinstance(obj, dict) and obj.get("datePublished"):
+                        value = str(obj["datePublished"])
+
+                        try:
+                            dt = datetime.fromisoformat(
+                                value.replace("Z", "+00:00")
+                            )
+                            return dt.astimezone(IST)
+                        except Exception:
+                            d = parse_date(value)
+                            if d:
+                                return d
+
+    # 3. Visible time/date elements
     for tag in soup.find_all(["time", "span"]):
         value = tag.get("datetime") or tag.get_text(" ", strip=True)
         d = parse_date(value)
