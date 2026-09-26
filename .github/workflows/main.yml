@@ -33,7 +33,7 @@ jobs:
 
       - name: Run RetailiX automation
         run: |
-          python main.py
+          python test_n6_lite.py
 
       - name: Save updated Excel file
         run: |
