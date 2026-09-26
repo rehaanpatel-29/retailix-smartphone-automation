@@ -234,7 +234,7 @@ def resolve_google_news_url(url):
     try:
         r = requests.get(
             url,
-            headers={"User-Agent": USER_AGENT},
+           headers={"User-Agent": SESSION.headers["User-Agent"]},
             timeout=20,
             allow_redirects=True,
         )
