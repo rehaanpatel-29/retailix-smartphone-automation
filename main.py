@@ -989,8 +989,17 @@ def main():
     for url, title in google_results:
         merged.setdefault(url, title)
 
-    candidates = list(merged.items())
-    print("Combined discovery candidates:", len(candidates))
+   candidates = list(merged.items())
+
+if TEST_MODE:
+    candidates = [
+        (
+            "https://www.ndtvprofit.com/technology/oneplus-n6-lite-4g-launched-price-variant-display-batterey-no-cost-emi-and-more-12080366",
+            "OnePlus N6 Lite 4G Launched in India"
+        )
+    ]
+
+print("Combined discovery candidates:", len(candidates))
 
     # Keep only the ten requested brands.
     grouped = {brand: [] for brand in BRANDS}
