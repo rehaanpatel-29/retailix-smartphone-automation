@@ -10,12 +10,8 @@ import requests
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
-import json
 import feedparser
-TEST_MODE = True
-TEST_MODEL = "OnePlus N6 Lite"
-
-
+import json
 
 # ============================================================
 # RETAILIX SMARTPHONE AUTOMATION
@@ -438,7 +434,7 @@ def qualifying_ndtv(title, html, brand, start, end):
     title_low = title.lower()
     body_low = body[:12000].lower()
 
-    # Reject obvious non-launch stories
+    # Reject obvious non-launch stories based primarily on the headline.
     if any(x in title_low for x in BAD_WORDS):
         return False
 
@@ -458,17 +454,11 @@ def qualifying_ndtv(title, html, brand, start, end):
     if not any(x in (title_low + " " + body_low) for x in aliases[brand]):
         return False
 
-    # Launch language must be present
+    # Launch language may appear in the article body rather than the title.
     if not any(x in (title_low + " " + body_low) for x in LAUNCH_WORDS):
         return False
 
-    # TEST MODE: allow the known OnePlus N6 Lite through
-    # so we can test the complete official-site pipeline.
-    if TEST_MODE and TEST_MODEL.lower() in title_low:
-        return True
-
     dt = article_date(html)
-
     if not dt:
         return False
 
@@ -989,17 +979,8 @@ def main():
     for url, title in google_results:
         merged.setdefault(url, title)
 
-   candidates = list(merged.items())
-
-if TEST_MODE:
-    candidates = [
-        (
-            "https://www.ndtvprofit.com/technology/oneplus-n6-lite-4g-launched-price-variant-display-batterey-no-cost-emi-and-more-12080366",
-            "OnePlus N6 Lite 4G Launched in India"
-        )
-    ]
-
-print("Combined discovery candidates:", len(candidates))
+    candidates = list(merged.items())
+    print("Combined discovery candidates:", len(candidates))
 
     # Keep only the ten requested brands.
     grouped = {brand: [] for brand in BRANDS}
