@@ -93,7 +93,8 @@ BAD_WORDS = (
     "upcoming", "rumour", "rumor", "leak", "leaked", "expected",
     "may launch", "could launch", "might launch", "tipped", "teased",
     "teaser", "review", "comparison", "discount", "offer", "concept",
-    "speculation", "hands-on"
+    "speculation", "hands-on", "launch date", "set for", "to launch",
+    "will launch", "launching on", "coming soon", "ahead of launch"
 )
 
 SESSION = requests.Session()
@@ -353,8 +354,8 @@ def ndtv_candidates():
     return list(out.items())
 
 def candidate_brand(title):
+    """Assign the brand from the earliest strong brand mention in the headline."""
     low = title.lower()
-
     aliases = {
         "APPLE": ["iphone", "apple"],
         "INFINIX": ["infinix"],
@@ -367,11 +368,16 @@ def candidate_brand(title):
         "SAMSUNG": ["samsung", "galaxy"],
         "VIVO": ["vivo"],
     }
-
+    hits = []
     for brand, words in aliases.items():
-        if any(w in low for w in words):
-            return brand
-    return None
+        for word in words:
+            m = re.search(r"(?<![a-z0-9])" + re.escape(word.lower()) + r"(?![a-z0-9])", low)
+            if m:
+                hits.append((m.start(), brand))
+    if not hits:
+        return None
+    hits.sort(key=lambda x: (x[0], x[1]))
+    return hits[0][1]
 
 
 def qualifying_ndtv(title, html, brand, start, end):
@@ -726,111 +732,70 @@ def normalize_capacity(value):
 
 
 def extract_variants(html, model):
-    """
-    STRICT RULE:
-    A row is created only when Color + Storage + RAM can be mapped
-    to the same explicit variant. No Cartesian product.
-    """
+    """Extract exact variants without blind RAM/storage/color Cartesian products."""
     soup = BeautifulSoup(html, "html.parser")
     text = clean(soup.get_text(" ", strip=True))
-
     found = []
 
-    # 1. Structured JSON / HTML text containing explicit RAM + storage.
-    # Common forms: 8GB RAM / 256GB, 12GB+256GB, 8 GB + 128 GB.
-    pattern = re.compile(
+    # Explicit combined configuration: 8GB + 256GB / 8GB RAM 256GB.
+    combined = re.compile(
         r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*(?:\+|/|\||,|with)\s*"
-        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
-        re.I
+        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)", re.I
     )
-
     pairs = []
-    for m in pattern.finditer(text):
-        ram = f"{m.group('ram')} GB"
-        storage = f"{m.group('storage')} {m.group('unit').upper()}"
-        pair = (ram, storage)
-        if pair not in pairs:
-            pairs.append(pair)
+    for m in combined.finditer(text):
+        pair=(f"{m.group('ram')} GB", f"{m.group('storage')} {m.group('unit').upper()}")
+        if pair not in pairs: pairs.append(pair)
 
-    # 2. Explicit variant blocks. We only accept a color when the same
-    # small block contains the RAM/storage pair.
-    blocks = soup.find_all(["li", "div", "section", "article", "label", "option"])
-
-    color_re = re.compile(
-        r"(?:colour|color|colourway|colorway)\s*[:\-]?\s*"
-        r"([A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})",
-        re.I
-    )
-
+    color_re = re.compile(r"(?:colour|color|colourway|colorway)\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})", re.I)
+    blocks = soup.find_all(["li","div","section","article","label","option"])
     for block in blocks:
-        block_text = clean(block.get_text(" ", strip=True))
-        if len(block_text) > 500:
-            continue
-
-        pm = pattern.search(block_text)
-        cm = color_re.search(block_text)
-
+        t=clean(block.get_text(" ", strip=True))
+        if len(t)>500: continue
+        pm=combined.search(t); cm=color_re.search(t)
         if pm and cm:
-            ram = f"{pm.group('ram')} GB"
-            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
-            color = clean(cm.group(1))
+            c=clean(cm.group(1))
+            item=(c, f"{pm.group('storage')} {pm.group('unit').upper()}", f"{pm.group('ram')} GB")
+            if item not in found: found.append(item)
 
-            # Remove obvious trailing labels.
-            color = re.split(
-                r"\s+(?:ram|storage|memory|price|₹|\|)\b",
-                color,
-                flags=re.I
-            )[0].strip()
+    # Separate official declarations, e.g. RAM: 4 GB and Storage: 64 GB.
+    ram_vals=[]; storage_vals=[]; colors=[]
+    for m in re.finditer(r"(?:ram|memory)\s*[:\-]?\s*(\d{1,2})\s*GB", text, re.I):
+        v=f"{m.group(1)} GB"
+        if v not in ram_vals: ram_vals.append(v)
+    for m in re.finditer(r"(?:storage|internal storage)\s*[:\-]?\s*(\d{2,4})\s*(GB|TB)", text, re.I):
+        v=f"{m.group(1)} {m.group(2).upper()}"
+        if v not in storage_vals: storage_vals.append(v)
+    for m in color_re.finditer(text):
+        c=clean(m.group(1))
+        c=re.split(r"\s+(?:ram|storage|memory|price|available|select)\b",c,flags=re.I)[0].strip()
+        if 2<=len(c)<=45 and c.lower() not in {x.lower() for x in colors}: colors.append(c)
 
-            item = (color, storage, ram)
-            if item not in found:
-                found.append(item)
+    # Safe single-configuration rule: one explicit RAM + one explicit storage
+    # can be paired with each explicitly listed product color. This is not a
+    # Cartesian product because there is only one configuration.
+    if not found and len(ram_vals)==1 and len(storage_vals)==1 and colors:
+        for c in colors:
+            item=(c, storage_vals[0], ram_vals[0])
+            if item not in found: found.append(item)
 
-    # 3. Common product JSON-LD / data attributes.
-    for tag in soup.find_all(["script"]):
-        raw = tag.string or tag.get_text()
-        if not raw or len(raw) > 500000:
-            continue
-
-        for pm in pattern.finditer(raw):
-            ram = f"{pm.group('ram')} GB"
-            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
-
-            before = raw[max(0, pm.start() - 1000):pm.start()]
-            after = raw[pm.end():pm.end() + 1000]
-            nearby = before + " " + after
-
-            cm = color_re.search(nearby)
+    # JSON/data attributes can contain a single explicit configuration.
+    if not found:
+        raw_all=" ".join((tag.string or tag.get_text()) for tag in soup.find_all("script") if (tag.string or tag.get_text()))
+        for pm in combined.finditer(raw_all):
+            ram=f"{pm.group('ram')} GB"; storage=f"{pm.group('storage')} {pm.group('unit').upper()}"
+            nearby=raw_all[max(0,pm.start()-1500):pm.end()+1500]
+            cm=color_re.search(nearby)
             if cm:
-                color = clean(cm.group(1))
-                item = (color, storage, ram)
-                if item not in found:
-                    found.append(item)
+                item=(clean(cm.group(1)),storage,ram)
+                if item not in found: found.append(item)
 
-    # Deduplicate, normalize, and reject junk colors.
-    clean_found = []
-    bad_colors = {
-        "black", "white", "blue", "green", "red", "silver",
-        "grey", "gray", "gold", "pink", "purple"
-    }
-
-    for color, storage, ram in found:
-        color = clean(color)
-        storage = normalize_capacity(storage)
-        ram = normalize_capacity(ram)
-
-        if len(color) < 2 or len(color) > 45:
-            continue
-
-        # Do not reject generic color names: official pages may legitimately
-        # use them. Only reject obvious UI words.
-        if color.lower() in {"select", "choose", "available", "variant", "color"}:
-            continue
-
-        item = (color, storage, ram)
-        if item not in clean_found:
-            clean_found.append(item)
-
+    clean_found=[]
+    for color,storage,ram in found:
+        color=clean(color); storage=normalize_capacity(storage); ram=normalize_capacity(ram)
+        if 2<=len(color)<=45 and color.lower() not in {"select","choose","available","variant","color"}:
+            item=(color,storage,ram)
+            if item not in clean_found: clean_found.append(item)
     return clean_found
 
 
@@ -919,7 +884,7 @@ def main():
             continue
         if not any(w in title.lower() for w in LAUNCH_WORDS):
             continue
-        if len(grouped[brand]) < 8:
+        if len(grouped[brand]) < 4:
             grouped[brand].append((url, title, dt))
 
     additions = []
