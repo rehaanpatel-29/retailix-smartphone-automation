@@ -11,7 +11,6 @@ from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 import feedparser
-import json
 
 # ============================================================
 # RETAILIX SMARTPHONE AUTOMATION
@@ -103,6 +102,8 @@ SESSION.headers.update({
                   "AppleWebKit/537.36 Chrome/140 Safari/537.36"
 })
 
+GOOGLE_DATES = {}
+
 
 def clean(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
@@ -159,78 +160,24 @@ def parse_date(text):
 def article_date(html):
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Standard meta tags
     for attrs in (
         {"property": "article:published_time"},
         {"name": "publish-date"},
-        {"name": "published"},
         {"name": "date"},
-        {"name": "datePublished"},
         {"itemprop": "datePublished"},
-        {"property": "datePublished"},
     ):
         m = soup.find("meta", attrs=attrs)
         if m:
             value = m.get("content") or m.get("datetime")
             if value:
                 try:
-                    dt = datetime.fromisoformat(
-                        value.replace("Z", "+00:00")
-                    )
+                    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
                     return dt.astimezone(IST)
                 except Exception:
                     d = parse_date(value)
                     if d:
                         return d
 
-    # 2. JSON-LD structured data
-    for script in soup.find_all("script", type="application/ld+json"):
-        raw = script.string or script.get_text()
-        if not raw:
-            continue
-
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-
-        items = data if isinstance(data, list) else [data]
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            if item.get("datePublished"):
-                value = str(item["datePublished"])
-
-                try:
-                    dt = datetime.fromisoformat(
-                        value.replace("Z", "+00:00")
-                    )
-                    return dt.astimezone(IST)
-                except Exception:
-                    d = parse_date(value)
-                    if d:
-                        return d
-
-            # Some sites put the article inside @graph
-            graph = item.get("@graph")
-            if isinstance(graph, list):
-                for obj in graph:
-                    if isinstance(obj, dict) and obj.get("datePublished"):
-                        value = str(obj["datePublished"])
-
-                        try:
-                            dt = datetime.fromisoformat(
-                                value.replace("Z", "+00:00")
-                            )
-                            return dt.astimezone(IST)
-                        except Exception:
-                            d = parse_date(value)
-                            if d:
-                                return d
-
-    # 3. Visible time/date elements
     for tag in soup.find_all(["time", "span"]):
         value = tag.get("datetime") or tag.get_text(" ", strip=True)
         d = parse_date(value)
@@ -289,7 +236,7 @@ def resolve_google_news_url(url):
     try:
         r = requests.get(
             url,
-           headers={"User-Agent": SESSION.headers["User-Agent"]},
+            headers={"User-Agent": SESSION.headers.get("User-Agent", "Mozilla/5.0")},
             timeout=20,
             allow_redirects=True,
         )
@@ -303,19 +250,13 @@ def resolve_google_news_url(url):
 
 
 def google_news_candidates():
-    """
-    Google News is discovery-only.
-    It searches the 10 allowed brands + India/launch terms over the last 24h.
-    Verification/data still comes only from official India brand websites.
-    """
+    """Fast discovery: Google News RSS only. No publisher article fetching."""
     out = {}
     search_terms = [
         '"launched" smartphone India',
-        '"launch" smartphone India',
         '"launched in India" smartphone',
-        '"launched in India" phone',
         '"India launch" smartphone',
-        '"India launch" phone',
+        '"launched" phone India',
     ]
 
     for brand in BRANDS:
@@ -326,21 +267,16 @@ def google_news_candidates():
             url = (
                 "https://news.google.com/rss/search?"
                 + urllib.parse.urlencode({
-                    "q": query,
-                    "hl": "en-IN",
-                    "gl": "IN",
-                    "ceid": "IN:en",
+                    "q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"
                 })
             )
             try:
                 feed = feedparser.parse(url)
-                for entry in feed.entries[:30]:
+                for entry in feed.entries[:20]:
                     title = clean(getattr(entry, "title", ""))
                     link = getattr(entry, "link", "")
-                    published = getattr(entry, "published", "")
                     if not title or not link:
                         continue
-
                     low = title.lower()
                     if not any(a.lower() in low for a in brand_terms):
                         continue
@@ -349,13 +285,23 @@ def google_news_candidates():
                     if not any(w in low for w in LAUNCH_WORDS):
                         continue
 
-                    source_url = resolve_google_news_url(link)
-                    out[source_url] = title
+                    dt = None
+                    q = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+                    if q:
+                        try:
+                            dt = datetime(*q[:6], tzinfo=timezone.utc).astimezone(IST)
+                        except Exception:
+                            pass
+
+                    # Keep the RSS URL only as an identifier. We do not open
+                    # news articles; launch/data proof comes from official sites.
+                    out[link] = title
+                    if dt:
+                        GOOGLE_DATES[link] = dt
             except Exception:
                 continue
 
     return list(out.items())
-
 
 def ndtv_candidates():
     """
@@ -934,8 +880,8 @@ def backup_excel():
 
 def main():
     print("=" * 70)
-    print("RETAILIX DAILY SMARTPHONE AUTOMATION")
-    print("NDTV + GOOGLE NEWS DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION ONLY")
+    print("RETAILIX DAILY SMARTPHONE AUTOMATION - FAST CLOUD VERSION")
+    print("GOOGLE NEWS DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION")
     print("=" * 70)
 
     if not XLSX.exists():
@@ -943,149 +889,109 @@ def main():
 
     wb = load_workbook(XLSX)
     ws = wb["PRODUCT_DATA"]
-
     headers = [ws.cell(1, c).value for c in range(1, 21)]
     if headers != HEADERS:
         raise RuntimeError("RetailiX template headers do not match expected 20 columns.")
 
     cols = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-
     existing = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
         existing.add(tuple(
             str(row[cols[k] - 1] or "").strip().lower()
-            for k in (
-                "productName", "brandName",
-                "variant_Color", "variant_Storage", "variant_RAM"
-            )
+            for k in ("productName", "brandName", "variant_Color", "variant_Storage", "variant_RAM")
         ))
 
     end = now()
     start = end - timedelta(hours=24)
-
     print(f"Window: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    ndtv_results = ndtv_candidates()
-    print("NDTV candidates found:", len(ndtv_results))
+    candidates = google_news_candidates()
+    print("Google News candidates found:", len(candidates))
 
-    google_results = google_news_candidates()
-    print("Google News candidates found:", len(google_results))
-
-    # Merge NDTV + Google News discovery results.
-    merged = {}
-    for url, title in ndtv_results:
-        merged[url] = title
-    for url, title in google_results:
-        merged.setdefault(url, title)
-
-    candidates = list(merged.items())
-    print("Combined discovery candidates:", len(candidates))
-
-    # Keep only the ten requested brands.
     grouped = {brand: [] for brand in BRANDS}
-
     for url, title in candidates:
         brand = candidate_brand(title)
-        if brand and url not in [x[0] for x in grouped[brand]]:
-            grouped[brand].append((url, title))
+        if not brand:
+            continue
+        dt = GOOGLE_DATES.get(url)
+        if not dt or not (start <= dt <= end):
+            continue
+        if not any(w in title.lower() for w in LAUNCH_WORDS):
+            continue
+        if len(grouped[brand]) < 8:
+            grouped[brand].append((url, title, dt))
 
     additions = []
 
-    for brand, urls in grouped.items():
+    for brand, rows in grouped.items():
         print("\nChecking:", brand)
-
-        if not urls:
-            print("  No NDTV/Google News candidate.")
+        if not rows:
+            print("  No qualifying Google News candidate.")
             continue
 
         found_model = False
-
-        for ndtv_url, ndtv_title in urls[:12]:
-            if found_model:
-                break
-
-            html = get_html(ndtv_url)
-            if not html:
+        for news_url, title, published in rows:
+            model_hint = model_from_ndtv(title, brand)
+            if len(model_hint) < 3:
                 continue
 
-            if not qualifying_ndtv(ndtv_title, html, brand, start, end):
-                continue
+            print("  Discovery:", title)
+            print("  RSS date:", published.isoformat())
 
-            ndtv_dt = article_date(html)
-            model_hint = model_from_ndtv(ndtv_title, brand)
-
-            print("  Discovery:", ndtv_title)
-            print("  Source URL:", ndtv_url)
-            print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
-
-            # Official launch confirmation + official product page.
+            # Verify launch/product data only on the official India brand site.
             domains = BRANDS[brand]
-
             official_url, official_html = official_launch_confirmed(
-                model_hint, brand, domains, html
+                model_hint, brand, domains, ""
             )
 
             if not official_url or not official_html:
                 print("  SKIPPED: official India confirmation not found.")
                 continue
 
-            print("  Official:", official_url)
-
             name = product_name_from_official(official_html, model_hint)
-
-            # Never use an NDTV article headline as the product name.
-            if name.lower() == ndtv_title.lower():
-                print("  SKIPPED: official page did not provide an exact product name.")
+            if not name or len(name) < 3:
+                print("  SKIPPED: official product name not found.")
                 continue
 
             description = official_description(official_html, name)
-
             if len(description) < 60:
                 print("  SKIPPED: official product description not verified.")
                 continue
 
             variants = extract_variants(official_html, name)
-
             if not variants:
                 print("  SKIPPED: exact Color + Storage + RAM mapping not verified.")
                 continue
 
             images = official_images(official_html)
-
             if not images:
                 print("  SKIPPED: official product image not found.")
                 continue
 
+            added_here = 0
             for color, storage, ram in variants:
                 key = (
-                    name.strip().lower(),
-                    brand.lower(),
-                    color.strip().lower(),
-                    storage.strip().lower(),
-                    ram.strip().lower(),
+                    name.strip().lower(), brand.lower(), color.strip().lower(),
+                    storage.strip().lower(), ram.strip().lower()
                 )
-
                 if key in existing:
                     continue
 
                 additions.append({
-                    "name": name,
-                    "brand": brand,
-                    "short": description[:500],
-                    "long": description[:2000],
-                    "color": color,
-                    "storage": storage,
-                    "ram": ram,
-                    "images": images,
+                    "name": name, "brand": brand,
+                    "short": description[:500], "long": description[:2000],
+                    "color": color, "storage": storage, "ram": ram, "images": images
                 })
-
                 existing.add(key)
+                added_here += 1
 
-            print("  Product:", name)
+            print("  VERIFIED OFFICIAL:", name)
+            print("  Official:", official_url)
             print("  Exact variants:", len(variants))
-            print("  Official images:", len(images))
+            print("  New rows:", added_here)
             found_model = True
+            break
 
         if not found_model:
             print("  No qualifying verified launch.")
@@ -1096,37 +1002,21 @@ def main():
         return
 
     backup_excel()
-
     for p in additions:
         imgs = p["images"]
-
         ws.append([
-            p["name"],
-            p["brand"],
-            "Electronics",
-            "Accessories",
-            "piece",
-            "NO TAX APPLIED",
-            "NODISCOUNT0",
-            "1 Year Warranty",
-            p["short"],
-            p["long"],
-            "true",
-            "false",
-            p["color"],
-            p["storage"],
-            p["ram"],
-            imgs[0] if len(imgs) > 0 else "",
-            "true",
+            p["name"], p["brand"], "Electronics", "Accessories", "piece",
+            "NO TAX APPLIED", "NODISCOUNT0", "1 Year Warranty",
+            p["short"], p["long"], "true", "false",
+            p["color"], p["storage"], p["ram"],
+            imgs[0] if len(imgs) > 0 else "", "true",
             imgs[1] if len(imgs) > 1 else "",
             imgs[2] if len(imgs) > 2 else "",
             imgs[3] if len(imgs) > 3 else "",
         ])
 
     wb.save(XLSX)
-
     print("\nRows added:", len(additions))
-    print("Rows skipped: verified duplicates / incomplete official data")
     print("AUTOMATION COMPLETED")
 
 
