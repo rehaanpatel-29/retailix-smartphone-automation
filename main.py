@@ -93,8 +93,7 @@ BAD_WORDS = (
     "upcoming", "rumour", "rumor", "leak", "leaked", "expected",
     "may launch", "could launch", "might launch", "tipped", "teased",
     "teaser", "review", "comparison", "discount", "offer", "concept",
-    "speculation", "hands-on", "launch date", "set for", "to launch",
-    "will launch", "launching on", "coming soon", "ahead of launch"
+    "speculation", "hands-on"
 )
 
 SESSION = requests.Session()
@@ -102,8 +101,6 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 Chrome/140 Safari/537.36"
 })
-
-GOOGLE_DATES = {}
 
 
 def clean(value):
@@ -251,33 +248,44 @@ def resolve_google_news_url(url):
 
 
 def google_news_candidates():
-    """Fast discovery: Google News RSS only. No publisher article fetching."""
+    """
+    Google News is discovery-only.
+    It searches the 10 allowed brands + India/launch terms over the last 24h.
+    Verification/data still comes only from official India brand websites.
+    """
     out = {}
     search_terms = [
         '"launched" smartphone India',
+        '"launch" smartphone India',
         '"launched in India" smartphone',
+        '"launched in India" phone',
         '"India launch" smartphone',
-        '"launched" phone India',
+        '"India launch" phone',
     ]
 
     for brand in BRANDS:
         brand_terms = [brand] + BRAND_ALIASES.get(brand, [])
         brand_query = "(" + " OR ".join(brand_terms) + ")"
         for term in search_terms:
-            query = f"{brand_query} {term} when:1d"
+            query = f"{brand_query} {term} after:2026-09-21 before:2026-09-24"
             url = (
                 "https://news.google.com/rss/search?"
                 + urllib.parse.urlencode({
-                    "q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"
+                    "q": query,
+                    "hl": "en-IN",
+                    "gl": "IN",
+                    "ceid": "IN:en",
                 })
             )
             try:
                 feed = feedparser.parse(url)
-                for entry in feed.entries[:20]:
+                for entry in feed.entries[:30]:
                     title = clean(getattr(entry, "title", ""))
                     link = getattr(entry, "link", "")
+                    published = getattr(entry, "published", "")
                     if not title or not link:
                         continue
+
                     low = title.lower()
                     if not any(a.lower() in low for a in brand_terms):
                         continue
@@ -286,23 +294,13 @@ def google_news_candidates():
                     if not any(w in low for w in LAUNCH_WORDS):
                         continue
 
-                    dt = None
-                    q = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
-                    if q:
-                        try:
-                            dt = datetime(*q[:6], tzinfo=timezone.utc).astimezone(IST)
-                        except Exception:
-                            pass
-
-                    # Keep the RSS URL only as an identifier. We do not open
-                    # news articles; launch/data proof comes from official sites.
-                    out[link] = title
-                    if dt:
-                        GOOGLE_DATES[link] = dt
+                    source_url = resolve_google_news_url(link)
+                    out[source_url] = title
             except Exception:
                 continue
 
     return list(out.items())
+
 
 def ndtv_candidates():
     """
@@ -354,8 +352,8 @@ def ndtv_candidates():
     return list(out.items())
 
 def candidate_brand(title):
-    """Assign the brand from the earliest strong brand mention in the headline."""
     low = title.lower()
+
     aliases = {
         "APPLE": ["iphone", "apple"],
         "INFINIX": ["infinix"],
@@ -368,16 +366,11 @@ def candidate_brand(title):
         "SAMSUNG": ["samsung", "galaxy"],
         "VIVO": ["vivo"],
     }
-    hits = []
+
     for brand, words in aliases.items():
-        for word in words:
-            m = re.search(r"(?<![a-z0-9])" + re.escape(word.lower()) + r"(?![a-z0-9])", low)
-            if m:
-                hits.append((m.start(), brand))
-    if not hits:
-        return None
-    hits.sort(key=lambda x: (x[0], x[1]))
-    return hits[0][1]
+        if any(w in low for w in words):
+            return brand
+    return None
 
 
 def qualifying_ndtv(title, html, brand, start, end):
@@ -732,70 +725,111 @@ def normalize_capacity(value):
 
 
 def extract_variants(html, model):
-    """Extract exact variants without blind RAM/storage/color Cartesian products."""
+    """
+    STRICT RULE:
+    A row is created only when Color + Storage + RAM can be mapped
+    to the same explicit variant. No Cartesian product.
+    """
     soup = BeautifulSoup(html, "html.parser")
     text = clean(soup.get_text(" ", strip=True))
+
     found = []
 
-    # Explicit combined configuration: 8GB + 256GB / 8GB RAM 256GB.
-    combined = re.compile(
+    # 1. Structured JSON / HTML text containing explicit RAM + storage.
+    # Common forms: 8GB RAM / 256GB, 12GB+256GB, 8 GB + 128 GB.
+    pattern = re.compile(
         r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*(?:\+|/|\||,|with)\s*"
-        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)", re.I
+        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
+        re.I
     )
+
     pairs = []
-    for m in combined.finditer(text):
-        pair=(f"{m.group('ram')} GB", f"{m.group('storage')} {m.group('unit').upper()}")
-        if pair not in pairs: pairs.append(pair)
+    for m in pattern.finditer(text):
+        ram = f"{m.group('ram')} GB"
+        storage = f"{m.group('storage')} {m.group('unit').upper()}"
+        pair = (ram, storage)
+        if pair not in pairs:
+            pairs.append(pair)
 
-    color_re = re.compile(r"(?:colour|color|colourway|colorway)\s*[:\-]?\s*([A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})", re.I)
-    blocks = soup.find_all(["li","div","section","article","label","option"])
+    # 2. Explicit variant blocks. We only accept a color when the same
+    # small block contains the RAM/storage pair.
+    blocks = soup.find_all(["li", "div", "section", "article", "label", "option"])
+
+    color_re = re.compile(
+        r"(?:colour|color|colourway|colorway)\s*[:\-]?\s*"
+        r"([A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})",
+        re.I
+    )
+
     for block in blocks:
-        t=clean(block.get_text(" ", strip=True))
-        if len(t)>500: continue
-        pm=combined.search(t); cm=color_re.search(t)
+        block_text = clean(block.get_text(" ", strip=True))
+        if len(block_text) > 500:
+            continue
+
+        pm = pattern.search(block_text)
+        cm = color_re.search(block_text)
+
         if pm and cm:
-            c=clean(cm.group(1))
-            item=(c, f"{pm.group('storage')} {pm.group('unit').upper()}", f"{pm.group('ram')} GB")
-            if item not in found: found.append(item)
+            ram = f"{pm.group('ram')} GB"
+            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
+            color = clean(cm.group(1))
 
-    # Separate official declarations, e.g. RAM: 4 GB and Storage: 64 GB.
-    ram_vals=[]; storage_vals=[]; colors=[]
-    for m in re.finditer(r"(?:ram|memory)\s*[:\-]?\s*(\d{1,2})\s*GB", text, re.I):
-        v=f"{m.group(1)} GB"
-        if v not in ram_vals: ram_vals.append(v)
-    for m in re.finditer(r"(?:storage|internal storage)\s*[:\-]?\s*(\d{2,4})\s*(GB|TB)", text, re.I):
-        v=f"{m.group(1)} {m.group(2).upper()}"
-        if v not in storage_vals: storage_vals.append(v)
-    for m in color_re.finditer(text):
-        c=clean(m.group(1))
-        c=re.split(r"\s+(?:ram|storage|memory|price|available|select)\b",c,flags=re.I)[0].strip()
-        if 2<=len(c)<=45 and c.lower() not in {x.lower() for x in colors}: colors.append(c)
+            # Remove obvious trailing labels.
+            color = re.split(
+                r"\s+(?:ram|storage|memory|price|₹|\|)\b",
+                color,
+                flags=re.I
+            )[0].strip()
 
-    # Safe single-configuration rule: one explicit RAM + one explicit storage
-    # can be paired with each explicitly listed product color. This is not a
-    # Cartesian product because there is only one configuration.
-    if not found and len(ram_vals)==1 and len(storage_vals)==1 and colors:
-        for c in colors:
-            item=(c, storage_vals[0], ram_vals[0])
-            if item not in found: found.append(item)
+            item = (color, storage, ram)
+            if item not in found:
+                found.append(item)
 
-    # JSON/data attributes can contain a single explicit configuration.
-    if not found:
-        raw_all=" ".join((tag.string or tag.get_text()) for tag in soup.find_all("script") if (tag.string or tag.get_text()))
-        for pm in combined.finditer(raw_all):
-            ram=f"{pm.group('ram')} GB"; storage=f"{pm.group('storage')} {pm.group('unit').upper()}"
-            nearby=raw_all[max(0,pm.start()-1500):pm.end()+1500]
-            cm=color_re.search(nearby)
+    # 3. Common product JSON-LD / data attributes.
+    for tag in soup.find_all(["script"]):
+        raw = tag.string or tag.get_text()
+        if not raw or len(raw) > 500000:
+            continue
+
+        for pm in pattern.finditer(raw):
+            ram = f"{pm.group('ram')} GB"
+            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
+
+            before = raw[max(0, pm.start() - 1000):pm.start()]
+            after = raw[pm.end():pm.end() + 1000]
+            nearby = before + " " + after
+
+            cm = color_re.search(nearby)
             if cm:
-                item=(clean(cm.group(1)),storage,ram)
-                if item not in found: found.append(item)
+                color = clean(cm.group(1))
+                item = (color, storage, ram)
+                if item not in found:
+                    found.append(item)
 
-    clean_found=[]
-    for color,storage,ram in found:
-        color=clean(color); storage=normalize_capacity(storage); ram=normalize_capacity(ram)
-        if 2<=len(color)<=45 and color.lower() not in {"select","choose","available","variant","color"}:
-            item=(color,storage,ram)
-            if item not in clean_found: clean_found.append(item)
+    # Deduplicate, normalize, and reject junk colors.
+    clean_found = []
+    bad_colors = {
+        "black", "white", "blue", "green", "red", "silver",
+        "grey", "gray", "gold", "pink", "purple"
+    }
+
+    for color, storage, ram in found:
+        color = clean(color)
+        storage = normalize_capacity(storage)
+        ram = normalize_capacity(ram)
+
+        if len(color) < 2 or len(color) > 45:
+            continue
+
+        # Do not reject generic color names: official pages may legitimately
+        # use them. Only reject obvious UI words.
+        if color.lower() in {"select", "choose", "available", "variant", "color"}:
+            continue
+
+        item = (color, storage, ram)
+        if item not in clean_found:
+            clean_found.append(item)
+
     return clean_found
 
 
@@ -845,8 +879,8 @@ def backup_excel():
 
 def main():
     print("=" * 70)
-    print("RETAILIX DAILY SMARTPHONE AUTOMATION - FAST CLOUD VERSION")
-    print("GOOGLE NEWS DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION")
+    print("RETAILIX DAILY SMARTPHONE AUTOMATION")
+    print("NDTV + GOOGLE NEWS DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION ONLY")
     print("=" * 70)
 
     if not XLSX.exists():
@@ -854,109 +888,151 @@ def main():
 
     wb = load_workbook(XLSX)
     ws = wb["PRODUCT_DATA"]
+
     headers = [ws.cell(1, c).value for c in range(1, 21)]
     if headers != HEADERS:
         raise RuntimeError("RetailiX template headers do not match expected 20 columns.")
 
     cols = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
+
     existing = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
         existing.add(tuple(
             str(row[cols[k] - 1] or "").strip().lower()
-            for k in ("productName", "brandName", "variant_Color", "variant_Storage", "variant_RAM")
+            for k in (
+                "productName", "brandName",
+                "variant_Color", "variant_Storage", "variant_RAM"
+            )
         ))
 
-    end = now()
-    start = end - timedelta(hours=24)
-    print(f"Window: {start.isoformat()} -> {end.isoformat()}")
+    TEST_DATE_START = datetime(2026, 9, 22, 0, 0, 0, tzinfo=IST)
+    TEST_DATE_END = datetime(2026, 9, 23, 0, 0, 0, tzinfo=IST)
+    start = TEST_DATE_START
+    end = TEST_DATE_END
+
+    print(f"TEST DATE WINDOW: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    candidates = google_news_candidates()
-    print("Google News candidates found:", len(candidates))
+    ndtv_results = ndtv_candidates()
+    print("NDTV candidates found:", len(ndtv_results))
 
+    google_results = google_news_candidates()
+    print("Google News candidates found:", len(google_results))
+
+    # Merge NDTV + Google News discovery results.
+    merged = {}
+    for url, title in ndtv_results:
+        merged[url] = title
+    for url, title in google_results:
+        merged.setdefault(url, title)
+
+    candidates = list(merged.items())
+    print("Combined discovery candidates:", len(candidates))
+
+    # Keep only the ten requested brands.
     grouped = {brand: [] for brand in BRANDS}
+
     for url, title in candidates:
         brand = candidate_brand(title)
-        if not brand:
-            continue
-        dt = GOOGLE_DATES.get(url)
-        if not dt or not (start <= dt <= end):
-            continue
-        if not any(w in title.lower() for w in LAUNCH_WORDS):
-            continue
-        if len(grouped[brand]) < 4:
-            grouped[brand].append((url, title, dt))
+        if brand and url not in [x[0] for x in grouped[brand]]:
+            grouped[brand].append((url, title))
 
     additions = []
 
-    for brand, rows in grouped.items():
+    for brand, urls in grouped.items():
         print("\nChecking:", brand)
-        if not rows:
-            print("  No qualifying Google News candidate.")
+
+        if not urls:
+            print("  No NDTV/Google News candidate.")
             continue
 
         found_model = False
-        for news_url, title, published in rows:
-            model_hint = model_from_ndtv(title, brand)
-            if len(model_hint) < 3:
+
+        for ndtv_url, ndtv_title in urls[:12]:
+            if found_model:
+                break
+
+            html = get_html(ndtv_url)
+            if not html:
                 continue
 
-            print("  Discovery:", title)
-            print("  RSS date:", published.isoformat())
+            if not qualifying_ndtv(ndtv_title, html, brand, start, end):
+                continue
 
-            # Verify launch/product data only on the official India brand site.
+            ndtv_dt = article_date(html)
+            model_hint = model_from_ndtv(ndtv_title, brand)
+
+            print("  Discovery:", ndtv_title)
+            print("  Source URL:", ndtv_url)
+            print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
+
+            # Official launch confirmation + official product page.
             domains = BRANDS[brand]
+
             official_url, official_html = official_launch_confirmed(
-                model_hint, brand, domains, ""
+                model_hint, brand, domains, html
             )
 
             if not official_url or not official_html:
                 print("  SKIPPED: official India confirmation not found.")
                 continue
 
+            print("  Official:", official_url)
+
             name = product_name_from_official(official_html, model_hint)
-            if not name or len(name) < 3:
-                print("  SKIPPED: official product name not found.")
+
+            # Never use an NDTV article headline as the product name.
+            if name.lower() == ndtv_title.lower():
+                print("  SKIPPED: official page did not provide an exact product name.")
                 continue
 
             description = official_description(official_html, name)
+
             if len(description) < 60:
                 print("  SKIPPED: official product description not verified.")
                 continue
 
             variants = extract_variants(official_html, name)
+
             if not variants:
                 print("  SKIPPED: exact Color + Storage + RAM mapping not verified.")
                 continue
 
             images = official_images(official_html)
+
             if not images:
                 print("  SKIPPED: official product image not found.")
                 continue
 
-            added_here = 0
             for color, storage, ram in variants:
                 key = (
-                    name.strip().lower(), brand.lower(), color.strip().lower(),
-                    storage.strip().lower(), ram.strip().lower()
+                    name.strip().lower(),
+                    brand.lower(),
+                    color.strip().lower(),
+                    storage.strip().lower(),
+                    ram.strip().lower(),
                 )
+
                 if key in existing:
                     continue
 
                 additions.append({
-                    "name": name, "brand": brand,
-                    "short": description[:500], "long": description[:2000],
-                    "color": color, "storage": storage, "ram": ram, "images": images
+                    "name": name,
+                    "brand": brand,
+                    "short": description[:500],
+                    "long": description[:2000],
+                    "color": color,
+                    "storage": storage,
+                    "ram": ram,
+                    "images": images,
                 })
-                existing.add(key)
-                added_here += 1
 
-            print("  VERIFIED OFFICIAL:", name)
-            print("  Official:", official_url)
+                existing.add(key)
+
+            print("  Product:", name)
             print("  Exact variants:", len(variants))
-            print("  New rows:", added_here)
+            print("  Official images:", len(images))
             found_model = True
-            break
 
         if not found_model:
             print("  No qualifying verified launch.")
@@ -967,21 +1043,37 @@ def main():
         return
 
     backup_excel()
+
     for p in additions:
         imgs = p["images"]
+
         ws.append([
-            p["name"], p["brand"], "Electronics", "Accessories", "piece",
-            "NO TAX APPLIED", "NODISCOUNT0", "1 Year Warranty",
-            p["short"], p["long"], "true", "false",
-            p["color"], p["storage"], p["ram"],
-            imgs[0] if len(imgs) > 0 else "", "true",
+            p["name"],
+            p["brand"],
+            "Electronics",
+            "Accessories",
+            "piece",
+            "NO TAX APPLIED",
+            "NODISCOUNT0",
+            "1 Year Warranty",
+            p["short"],
+            p["long"],
+            "true",
+            "false",
+            p["color"],
+            p["storage"],
+            p["ram"],
+            imgs[0] if len(imgs) > 0 else "",
+            "true",
             imgs[1] if len(imgs) > 1 else "",
             imgs[2] if len(imgs) > 2 else "",
             imgs[3] if len(imgs) > 3 else "",
         ])
 
     wb.save(XLSX)
+
     print("\nRows added:", len(additions))
+    print("Rows skipped: verified duplicates / incomplete official data")
     print("AUTOMATION COMPLETED")
 
 
