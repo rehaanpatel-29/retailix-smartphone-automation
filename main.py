@@ -216,54 +216,27 @@ def _collect_ndtv_links(html, base):
     return out
 
 
-def ndtv_candidates():
-    """
-    NDTV is the only discovery layer.
+def ndtv_candidates(start, end):
+    """Discover NDTV smartphone articles from NDTV's official monthly archive.
 
-    First try normal HTTP. If NDTV serves the topic page in a form that does
-    not expose article links to requests (which can happen with bot/CDN
-    handling), fall back to Playwright Chromium. This is still the same NDTV
-    source; no Google, Amazon, Flipkart, or other news site is used.
+    This avoids scraping NDTV topic pages, which can return zero links in
+    GitHub Actions. The archive is still NDTV-only and is filtered by the
+    exact requested date window.
     """
     out = {}
+    months = {(start.year, start.month), (end.year, end.month)}
 
-    for base in NDTV_URLS:
-        html = get_html(base)
-        if html:
-            out.update(_collect_ndtv_links(html, base))
+    for year, month in sorted(months):
+        archive_url = f"https://archives.ndtv.com/articles/{year}-{month:02d}.html"
+        html = get_html(archive_url, timeout=40)
+        if not html:
+            print(f"  NDTV archive unavailable: {archive_url}")
+            continue
+        out.update(_collect_ndtv_links(html, archive_url))
 
-    if out:
-        print(f"NDTV HTTP discovery: {len(out)} article candidates")
-        return list(out.items())
-
-    print("NDTV HTTP discovery returned 0 candidates; trying browser discovery...")
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "Chrome/140.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1365, "height": 900},
-            )
-
-            for base in NDTV_URLS:
-                try:
-                    page.goto(base, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(2500)
-                    html = page.content()
-                    out.update(_collect_ndtv_links(html, base))
-                except Exception as e:
-                    print(f"  Browser discovery failed for {base}: {e}")
-
-            browser.close()
-    except Exception as e:
-        print(f"NDTV browser discovery unavailable: {e}")
-
-    print(f"NDTV browser discovery: {len(out)} article candidates")
+    print(f"NDTV archive discovery: {len(out)} article candidates")
     return list(out.items())
+
 
 def candidate_brand(title):
     low = title.lower()
@@ -766,7 +739,7 @@ def main():
         print(f"Window: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    candidates = ndtv_candidates()
+    candidates = ndtv_candidates(start, end)
     print("NDTV candidates found:", len(candidates))
 
     # Keep only the ten requested brands.
