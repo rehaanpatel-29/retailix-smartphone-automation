@@ -548,64 +548,67 @@ def extract_variants(html, model):
     return clean_found
 
 
-def official_images(html):
-    """Extract real product images from the official brand page."""
-    soup = BeautifulSoup(html, "html.parser")
+def official_images(html, page_url=""):
+    """Extract real product images from the official brand page, including JS-rendered images."""
     out = []
 
     def add(url):
-        url = normalize_url(url)
+        url = normalize_url(url, page_url)
         if not url.startswith("http"):
             return
         low = url.lower()
         if any(x in low for x in (
-            "logo", "icon", "favicon", "sprite", "swatch",
-            "flag", "avatar", "banner", "tracking", "placeholder"
+            "logo", "icon", "favicon", "sprite", "swatch", "flag",
+            "avatar", "banner", "tracking", "placeholder"
         )):
             return
         if url not in out:
             out.append(url)
 
-    # Normal HTML image attributes, including lazy-loading variants.
+    soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["meta", "img", "source"]):
         if tag.name == "meta":
-            if tag.get("property") in ("og:image", "twitter:image"):
-                add(tag.get("content", ""))
+            add(tag.get("content", "") if tag.get("property") in ("og:image", "twitter:image") else "")
         elif tag.name == "img":
-            for attr in (
-                "src", "data-src", "data-lazy-src", "data-original",
-                "data-image", "data-image-url", "data-original-src"
-            ):
+            for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-image", "data-zoom-image"):
                 add(tag.get(attr, ""))
-            srcset = tag.get("srcset") or tag.get("data-srcset") or ""
+            srcset = tag.get("srcset", "")
             for part in srcset.split(","):
-                add(part.strip().split(" ", 1)[0])
+                add(part.strip().split(" ")[0])
         else:
-            srcset = tag.get("srcset") or tag.get("data-srcset") or ""
-            for part in srcset.split(","):
-                add(part.strip().split(" ", 1)[0])
+            for part in tag.get("srcset", "").split(","):
+                add(part.strip().split(" ")[0])
 
-        if len(out) >= 4:
-            return out[:4]
-
-    # OnePlus and other JS-heavy product pages can keep image URLs inside
-    # JSON/script data instead of normal img/src attributes.
+    # OnePlus and similar sites can put the actual image URLs inside JS.
     for script in soup.find_all("script"):
         raw = script.string or script.get_text() or ""
-        if not raw or len(raw) > 2000000:
-            continue
+        for m in re.findall(r'https?[^\"\'\s<>]+\.(?:jpg|jpeg|png|webp)(?:\?[^\"\'\s<>]*)?', raw, re.I):
+            add(m.replace('\\/', '/'))
+        if len(out) >= 4:
+            break
 
-        for m in re.finditer(
-            r"https?://[^\\\"'\s<>]+?\\.(?:jpg|jpeg|png|webp)(?:\\?[^\\\"'\\s<>]*)?",
-            raw,
-            flags=re.I,
-        ):
-            add(m.group(0))
-            if len(out) >= 4:
-                return out[:4]
+    # Final fallback: render the official page and collect browser-visible image URLs.
+    if len(out) < 1 and page_url:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "Chrome/140.0.0.0 Safari/537.36"
+                    )
+                )
+                page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3500)
+                for item in page.locator("img").evaluate_all(
+                    "els => els.map(e => ({src:e.src, current:e.currentSrc, data:e.getAttribute('data-src')}))"
+                ):
+                    add(item.get("current") or item.get("src") or item.get("data"))
+                browser.close()
+        except Exception:
+            pass
 
     return out[:4]
-
 
 def backup_excel():
     stamp = now().strftime("%Y%m%d_%H%M%S")
@@ -775,7 +778,7 @@ def main():
                 print("  SKIPPED: exact Color + Storage + RAM not verified.")
                 continue
 
-            images = official_images(official_html)
+            images = official_images(official_html, official_url)
             if not images:
                 print("  SKIPPED: official product image not found.")
                 continue
