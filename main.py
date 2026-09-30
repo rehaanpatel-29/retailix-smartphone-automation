@@ -549,40 +549,62 @@ def extract_variants(html, model):
 
 
 def official_images(html):
+    """Extract real product images from the official brand page."""
     soup = BeautifulSoup(html, "html.parser")
     out = []
 
-    for tag in soup.find_all(["meta", "img", "source"]):
-        url = ""
-
-        if tag.name == "meta":
-            if tag.get("property") in ("og:image", "twitter:image"):
-                url = tag.get("content", "")
-        elif tag.name == "img":
-            url = tag.get("src") or tag.get("data-src") or tag.get("data-lazy-src") or ""
-        else:
-            url = tag.get("srcset", "").split(",")[0].strip().split(" ")[0]
-
+    def add(url):
         url = normalize_url(url)
-
         if not url.startswith("http"):
-            continue
-
+            return
         low = url.lower()
-
         if any(x in low for x in (
             "logo", "icon", "favicon", "sprite", "swatch",
-            "flag", "avatar", "banner", "tracking"
+            "flag", "avatar", "banner", "tracking", "placeholder"
         )):
-            continue
-
+            return
         if url not in out:
             out.append(url)
 
-        if len(out) >= 4:
-            break
+    # Normal HTML image attributes, including lazy-loading variants.
+    for tag in soup.find_all(["meta", "img", "source"]):
+        if tag.name == "meta":
+            if tag.get("property") in ("og:image", "twitter:image"):
+                add(tag.get("content", ""))
+        elif tag.name == "img":
+            for attr in (
+                "src", "data-src", "data-lazy-src", "data-original",
+                "data-image", "data-image-url", "data-original-src"
+            ):
+                add(tag.get(attr, ""))
+            srcset = tag.get("srcset") or tag.get("data-srcset") or ""
+            for part in srcset.split(","):
+                add(part.strip().split(" ", 1)[0])
+        else:
+            srcset = tag.get("srcset") or tag.get("data-srcset") or ""
+            for part in srcset.split(","):
+                add(part.strip().split(" ", 1)[0])
 
-    return out
+        if len(out) >= 4:
+            return out[:4]
+
+    # OnePlus and other JS-heavy product pages can keep image URLs inside
+    # JSON/script data instead of normal img/src attributes.
+    for script in soup.find_all("script"):
+        raw = script.string or script.get_text() or ""
+        if not raw or len(raw) > 2000000:
+            continue
+
+        for m in re.finditer(
+            r"https?://[^\\\"'\s<>]+?\\.(?:jpg|jpeg|png|webp)(?:\\?[^\\\"'\\s<>]*)?",
+            raw,
+            flags=re.I,
+        ):
+            add(m.group(0))
+            if len(out) >= 4:
+                return out[:4]
+
+    return out[:4]
 
 
 def backup_excel():
