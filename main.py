@@ -10,6 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
+import feedparser
 
 # ============================================================
 # RETAILIX SMARTPHONE AUTOMATION
@@ -30,6 +31,34 @@ BRANDS = {
     "REALME": ["realme.com"],
     "SAMSUNG": ["samsung.com"],
     "VIVO": ["vivo.com"],
+}
+
+
+BRAND_ALIASES = {
+    "APPLE": ["Apple", "iPhone"],
+    "INFINIX": ["Infinix"],
+    "MOTOROLA": ["Motorola", "Moto"],
+    "ONEPLUS": ["OnePlus"],
+    "OPPO": ["OPPO"],
+    "POCO": ["POCO"],
+    "REDMI": ["Redmi", "Xiaomi"],
+    "REALME": ["realme"],
+    "SAMSUNG": ["Samsung", "Galaxy"],
+    "VIVO": ["vivo"],
+}
+
+
+BRAND_HOMES = {
+    "APPLE": "https://www.apple.com/in/",
+    "INFINIX": "https://infinixmobiles.in/",
+    "MOTOROLA": "https://www.motorola.in/",
+    "ONEPLUS": "https://www.oneplus.in/",
+    "OPPO": "https://www.oppo.com/in/",
+    "POCO": "https://www.mi.com/in/",
+    "REDMI": "https://www.mi.com/in/",
+    "REALME": "https://www.realme.com/in/",
+    "SAMSUNG": "https://www.samsung.com/in/",
+    "VIVO": "https://www.vivo.com/in/",
 }
 
 NDTV_URLS = [
@@ -156,53 +185,171 @@ def article_date(html):
     return None
 
 
+def _collect_ndtv_links(html, base):
+    """Extract article links from an NDTV topic page."""
+    out = {}
+    soup = BeautifulSoup(html, "html.parser")
+
+    for a in soup.find_all("a", href=True):
+        url = normalize_url(a["href"], base)
+        title = clean(a.get_text(" ", strip=True))
+
+        if not url.startswith("https://www.ndtv.com/"):
+            continue
+        if len(title) < 15:
+            continue
+
+        path = urlparse(url).path.lower()
+        if any(path.startswith(x) for x in (
+            "/topic/", "/video/", "/photos/", "/photo/",
+            "/webstories/", "/web-story/", "/live-updates/"
+        )):
+            continue
+
+        blob = title.lower()
+        if not any(x in blob for x in SMART_WORDS):
+            continue
+
+        # Keep discovery broad. Launch/review/leak filtering happens after
+        # opening the actual NDTV article.
+        if any(x in blob for x in (
+            "review", " vs ", "versus", "comparison", "price drop",
+            "discount", "deal", "offers", "best phones", "top phones",
+            "how to", "tips", "wallpaper", "case", "cover"
+        )):
+            continue
+
+        out[url] = title
+
+    return out
+
+
+
+
+def resolve_google_news_url(url):
+    """Turn a Google News RSS article URL into the original publisher URL."""
+    if not url or "news.google.com" not in url:
+        return url
+
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": SESSION.headers.get("User-Agent", "Mozilla/5.0")},
+            timeout=20,
+            allow_redirects=True,
+        )
+        final_url = r.url
+        if final_url and "news.google.com" not in final_url:
+            return final_url
+    except Exception:
+        pass
+
+    return url
+
+
+def google_news_candidates():
+    """
+    Google News is discovery-only.
+    It searches the 10 allowed brands + India/launch terms over the last 24h.
+    Verification/data still comes only from official India brand websites.
+    """
+    out = {}
+    search_terms = [
+        '"launched" smartphone India',
+        '"launch" smartphone India',
+        '"launched in India" smartphone',
+        '"launched in India" phone',
+        '"India launch" smartphone',
+        '"India launch" phone',
+    ]
+
+    for brand in BRANDS:
+        brand_terms = [brand] + BRAND_ALIASES.get(brand, [])
+        brand_query = "(" + " OR ".join(brand_terms) + ")"
+        for term in search_terms:
+            query = f"{brand_query} {term} after:2026-09-21 before:2026-09-24"
+            url = (
+                "https://news.google.com/rss/search?"
+                + urllib.parse.urlencode({
+                    "q": query,
+                    "hl": "en-IN",
+                    "gl": "IN",
+                    "ceid": "IN:en",
+                })
+            )
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:30]:
+                    title = clean(getattr(entry, "title", ""))
+                    link = getattr(entry, "link", "")
+                    published = getattr(entry, "published", "")
+                    if not title or not link:
+                        continue
+
+                    low = title.lower()
+                    if not any(a.lower() in low for a in brand_terms):
+                        continue
+                    if not any(w in low for w in SMART_WORDS):
+                        continue
+                    if not any(w in low for w in LAUNCH_WORDS):
+                        continue
+
+                    source_url = resolve_google_news_url(link)
+                    out[source_url] = title
+            except Exception:
+                continue
+
+    return list(out.items())
+
+
 def ndtv_candidates():
     """
     NDTV is the only discovery layer.
 
-    Important: do NOT require launch wording in the headline. NDTV launch
-    stories sometimes put the actual launch wording in the article body.
-    We collect recent smartphone/phone articles first, then qualifying_ndtv()
-    checks the full article for launch wording and the exact 24-hour window.
+    First try normal HTTP. If NDTV serves the topic page in a form that does
+    not expose article links to requests (which can happen with bot/CDN
+    handling), fall back to Playwright Chromium. This is still the same NDTV
+    source; no Google, Amazon, Flipkart, or other news site is used.
     """
     out = {}
 
     for base in NDTV_URLS:
         html = get_html(base)
-        if not html:
-            continue
+        if html:
+            out.update(_collect_ndtv_links(html, base))
 
-        soup = BeautifulSoup(html, "html.parser")
+    if out:
+        print(f"NDTV HTTP discovery: {len(out)} article candidates")
+        return list(out.items())
 
-        for a in soup.find_all("a", href=True):
-            url = normalize_url(a["href"], base)
-            title = clean(a.get_text(" ", strip=True))
+    print("NDTV HTTP discovery returned 0 candidates; trying browser discovery...")
 
-            if not url.startswith("https://www.ndtv.com/"):
-                continue
-            if len(title) < 15:
-                continue
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1365, "height": 900},
+            )
 
-            path = urlparse(url).path.lower()
-            if not (path.startswith("/technology/") or path.startswith("/tech/")):
-                continue
+            for base in NDTV_URLS:
+                try:
+                    page.goto(base, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                    html = page.content()
+                    out.update(_collect_ndtv_links(html, base))
+                except Exception as e:
+                    print(f"  Browser discovery failed for {base}: {e}")
 
-            blob = title.lower()
-            if not any(x in blob for x in SMART_WORDS):
-                continue
+            browser.close()
+    except Exception as e:
+        print(f"NDTV browser discovery unavailable: {e}")
 
-            # Avoid obvious non-launch content early, but do not reject a
-            # story merely because the headline lacks the word "launch".
-            if any(x in blob for x in (
-                "review", "vs", "versus", "comparison", "price drop",
-                "discount", "deal", "offers", "best phones", "top phones",
-                "how to", "tips", "wallpaper", "case", "cover"
-            )):
-                continue
-
-            out[url] = title
-
-    return [(u, t) for u, t in out.items()]
+    print(f"NDTV browser discovery: {len(out)} article candidates")
+    return list(out.items())
 
 def candidate_brand(title):
     low = title.lower()
@@ -315,18 +462,166 @@ def official_link_from_ndtv(ndtv_html, domains, model):
     return candidates[0][1] if candidates else ""
 
 
+
+def official_direct_product_urls(model, brand):
+    """Return conservative official India URL candidates for known site patterns."""
+    slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+    compact = re.sub(r"[^a-z0-9]+", "", model.lower())
+
+    patterns = {
+        "ONEPLUS": [
+            f"https://www.oneplus.in/{slug}",
+            f"https://www.oneplus.in/{compact}",
+        ],
+        "REALME": [
+            f"https://www.realme.com/in/realme-{slug}",
+            f"https://www.realme.com/in/{slug}",
+        ],
+        "MOTOROLA": [
+            f"https://www.motorola.in/smartphones-{slug}",
+            f"https://www.motorola.in/{slug}",
+        ],
+        "SAMSUNG": [
+            f"https://www.samsung.com/in/smartphones/{slug}/",
+        ],
+        "OPPO": [
+            f"https://www.oppo.com/in/smartphones/series-{slug}/",
+            f"https://www.oppo.com/in/smartphones/{slug}/",
+        ],
+        "VIVO": [
+            f"https://www.vivo.com/in/products/{slug}",
+        ],
+        "INFINIX": [
+            f"https://infinixmobility.com/{slug}",
+        ],
+        "APPLE": [
+            f"https://www.apple.com/in/{slug}/",
+        ],
+        "POCO": [
+            f"https://www.mi.com/in/product/{slug}/",
+        ],
+        "REDMI": [
+            f"https://www.mi.com/in/product/{slug}/",
+        ],
+    }
+    return patterns.get(brand, [])
+
+
+def official_product_url_from_home(model, brand, domains):
+    """Find a model page by crawling only the official India brand site."""
+    home = BRAND_HOMES.get(brand, "")
+    if not home:
+        return ""
+
+    words = [
+        w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
+        if len(w) >= 2
+    ]
+    if not words:
+        return ""
+
+    def score_link(url, text=""):
+        if not same_domain(url, domains):
+            return -1
+        blob = (url + " " + text).lower()
+        score = 0
+        for w in words:
+            if w in blob:
+                score += 3
+        if any(x in blob for x in ("phone", "smartphone", "mobile", "product")):
+            score += 2
+        if official_page_is_india(url):
+            score += 2
+        return score
+
+    # Fast HTTP crawl first.
+    html = get_html(home)
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        ranked = []
+        for a in soup.find_all("a", href=True):
+            u = normalize_url(a["href"], home)
+            score = score_link(u, clean(a.get_text(" ", strip=True)))
+            if score >= 5:
+                ranked.append((score, u))
+        if ranked:
+            ranked.sort(reverse=True)
+            return ranked[0][1]
+
+    # JS-heavy official sites: use the already-installed Playwright browser.
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                )
+            )
+            page.goto(home, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2500)
+            soup = BeautifulSoup(page.content(), "html.parser")
+            ranked = []
+            for a in soup.find_all("a", href=True):
+                u = normalize_url(a["href"], home)
+                score = score_link(u, clean(a.get_text(" ", strip=True)))
+                if score >= 5:
+                    ranked.append((score, u))
+            browser.close()
+            if ranked:
+                ranked.sort(reverse=True)
+                return ranked[0][1]
+    except Exception:
+        pass
+
+    return ""
+
+
 def official_launch_confirmed(model, brand, domains, ndtv_html):
     """
-    Verify the launch only on the official brand domain.
-    The official page must contain the model and clear launch/availability
-    language for India. No Google, marketplace, or other tech site is used.
+    Verify the launch only on the official India brand domain.
+    First use an official link inside the NDTV article; if NDTV does not
+    provide one, locate the model page by crawling the official India site.
     """
     product_url = official_link_from_ndtv(ndtv_html, domains, model)
+
+    if not product_url:
+        product_url = official_product_url_from_home(model, brand, domains)
+
+    # Last resort: try only deterministic URLs on the official India domain.
+    if not product_url:
+        for direct_url in official_direct_product_urls(model, brand):
+            try:
+                test_html = get_html(direct_url)
+                if test_html:
+                    soup = BeautifulSoup(test_html, "html.parser")
+                    body = clean(soup.get_text(" ", strip=True)).lower()
+                    words = [
+                        w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
+                        if len(w) >= 3
+                    ]
+                    if words and all(w in body for w in words[:2]):
+                        product_url = direct_url
+                        break
+            except Exception:
+                continue
 
     if not product_url:
         return "", ""
 
     official_html = get_html(product_url)
+    if not official_html:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                official_html = page.content()
+                browser.close()
+        except Exception:
+            official_html = ""
+
     if not official_html:
         return "", ""
 
@@ -336,7 +631,6 @@ def official_launch_confirmed(model, brand, domains, ndtv_html):
     model_low = model.lower()
 
     if model_low not in low:
-        # Try a slightly looser model match using significant words.
         words = [
             w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
             if len(w) >= 3
@@ -344,33 +638,24 @@ def official_launch_confirmed(model, brand, domains, ndtv_html):
         if not words or not all(w in low for w in words[:2]):
             return "", ""
 
+    # Official product pages commonly prove India availability through
+    # India-specific URLs plus buy/availability language rather than a
+    # literal "launched in India" sentence.
     launch_terms = (
-        "launched in india",
-        "launches in india",
-        "introduced in india",
-        "available in india",
-        "now available in india",
-        "goes on sale in india",
-        "sale begins in india",
-        "available from",
-        "available starting",
-        "available beginning",
-        "launch date",
+        "launched in india", "launches in india", "introduced in india",
+        "available in india", "now available in india",
+        "goes on sale in india", "sale begins in india", "available from",
+        "available starting", "available beginning", "buy now", "add to cart",
+        "out of stock", "notify me"
     )
 
-    if not any(term in low for term in launch_terms):
-        # Official product pages often state India availability without the
-        # exact phrase above. Accept explicit India + available/launch wording.
-        if "india" not in low:
-            return "", ""
-        if not any(x in low for x in ("launch", "available", "sale")):
-            return "", ""
+    has_india = "india" in low or official_page_is_india(product_url)
+    has_launch_signal = any(term in low for term in launch_terms)
+    if not (has_india and has_launch_signal):
+        return "", ""
 
-    if not official_page_is_india(product_url):
-        # Some official India product pages use a global-looking URL.
-        # Require explicit India text on the page in that case.
-        if "india" not in low:
-            return "", ""
+    if not official_page_is_india(product_url) and "india" not in low:
+        return "", ""
 
     return product_url, official_html
 
@@ -548,67 +833,121 @@ def extract_variants(html, model):
     return clean_found
 
 
-def official_images(html, page_url=""):
-    """Extract real product images from the official brand page, including JS-rendered images."""
-    out = []
+def official_images(html, page_url=None):
+    """Return actual product/gallery images, not feature graphics or badges."""
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
 
-    def add(url):
-        url = normalize_url(url, page_url)
+    BAD_TERMS = (
+        "logo", "icon", "favicon", "sprite", "swatch", "flag", "avatar",
+        "banner", "tracking", "ksp", "mit", "military", "durability",
+        "battery", "display", "refresh", "processor", "storage", "camera",
+        "ai-", "gemini", "charging", "feature", "spec", "infographic",
+        "ergonomic", "water", "dust", "power", "smooth", "fast-and-smooth"
+    )
+
+    GOOD_TERMS = (
+        "product", "gallery", "design", "color", "colour", "hero",
+        "n6-lite", "n6_lite", "n6lite", "phone", "device"
+    )
+
+    def score(url, alt="", context="", width=0, height=0):
+        text = (url + " " + alt + " " + context).lower()
+        if any(term in text for term in BAD_TERMS):
+            return -100
+        points = 0
+        if any(term in text for term in GOOD_TERMS):
+            points += 20
+        if "oneplus" in text:
+            points += 5
+        if width >= 500 and height >= 500:
+            points += 10
+        if width > 0 and height > 0:
+            ratio = width / height
+            if 0.35 <= ratio <= 1.8:
+                points += 5
+        # Product renders commonly have transparent/portrait-ish assets.
+        if 0.45 <= (width / height if height else 1) <= 1.25:
+            points += 4
+        return points
+
+    def add(url, alt="", context="", width=0, height=0):
+        url = normalize_url(url)
         if not url.startswith("http"):
             return
-        low = url.lower()
-        if any(x in low for x in (
-            "logo", "icon", "favicon", "sprite", "swatch", "flag",
-            "avatar", "banner", "tracking", "placeholder"
-        )):
+        sc = score(url, alt, context, width, height)
+        if sc < 0:
             return
-        if url not in out:
-            out.append(url)
+        candidates.append((sc, url))
 
-    soup = BeautifulSoup(html, "html.parser")
+    # Static HTML candidates.
     for tag in soup.find_all(["meta", "img", "source"]):
         if tag.name == "meta":
-            add(tag.get("content", "") if tag.get("property") in ("og:image", "twitter:image") else "")
+            if tag.get("property") in ("og:image", "twitter:image"):
+                add(tag.get("content", ""), tag.get("property", ""), "")
         elif tag.name == "img":
-            for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-image", "data-zoom-image"):
-                add(tag.get(attr, ""))
-            srcset = tag.get("srcset", "")
-            for part in srcset.split(","):
-                add(part.strip().split(" ")[0])
+            attrs = tag.attrs
+            for key in ("src", "data-src", "data-lazy-src", "data-original", "data-image", "data-zoom-image"):
+                if attrs.get(key):
+                    add(attrs[key], attrs.get("alt", ""), tag.parent.get_text(" ", strip=True)[:300] if tag.parent else "")
+            srcset = attrs.get("srcset", "")
+            if srcset:
+                for part in srcset.split(","):
+                    add(part.strip().split(" ")[0], attrs.get("alt", ""), "")
         else:
-            for part in tag.get("srcset", "").split(","):
-                add(part.strip().split(" ")[0])
+            srcset = tag.get("srcset", "")
+            if srcset:
+                for part in srcset.split(","):
+                    add(part.strip().split(" ")[0], "", "")
 
-    # OnePlus and similar sites can put the actual image URLs inside JS.
-    for script in soup.find_all("script"):
-        raw = script.string or script.get_text() or ""
-        for m in re.findall(r'https?[^\"\'\s<>]+\.(?:jpg|jpeg|png|webp)(?:\?[^\"\'\s<>]*)?', raw, re.I):
-            add(m.replace('\\/', '/'))
-        if len(out) >= 4:
-            break
-
-    # Final fallback: render the official page and collect browser-visible image URLs.
-    if len(out) < 1 and page_url:
+    # Render the page so lazy-loaded product/gallery images become available.
+    if page_url:
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                page = browser.new_page(
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "Chrome/140.0.0.0 Safari/537.36"
-                    )
-                )
-                page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3500)
-                for item in page.locator("img").evaluate_all(
-                    "els => els.map(e => ({src:e.src, current:e.currentSrc, data:e.getAttribute('data-src')}))"
-                ):
-                    add(item.get("current") or item.get("src") or item.get("data"))
-                browser.close()
-        except Exception:
-            pass
+                page = browser.new_page(viewport={"width": 1440, "height": 1000})
+                page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2500)
 
-    return out[:4]
+                # Trigger lazy loading without relying on a particular site structure.
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1800)
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(500)
+
+                rendered = page.locator("img").evaluate_all("""
+                    els => els.map(e => ({
+                        src: e.currentSrc || e.src || e.dataset.src || e.dataset.lazySrc || '',
+                        alt: e.alt || '',
+                        w: e.naturalWidth || 0,
+                        h: e.naturalHeight || 0,
+                        context: (e.parentElement ? e.parentElement.innerText : '').slice(0, 500)
+                    })).filter(x => x.src)
+                """)
+
+                for item in rendered:
+                    add(item["src"], item["alt"], item["context"], item["w"], item["h"])
+
+                # Also inspect picture/source elements rendered by the browser.
+                sources = page.locator("picture source, source[srcset]").evaluate_all("""
+                    els => els.map(e => e.srcset || '').filter(Boolean)
+                """)
+                for srcset in sources:
+                    for part in srcset.split(","):
+                        add(part.strip().split(" ")[0], "", "")
+
+                browser.close()
+        except Exception as exc:
+            print(f"  Image render fallback unavailable: {exc}")
+
+    # Deduplicate and rank. Keep only the strongest actual-product candidates.
+    best = {}
+    for sc, url in candidates:
+        best[url] = max(sc, best.get(url, -999))
+
+    ranked = sorted(best.items(), key=lambda x: (-x[1], x[0]))
+    return [url for url, _ in ranked[:4]]
+
 
 def backup_excel():
     stamp = now().strftime("%Y%m%d_%H%M%S")
@@ -617,54 +956,10 @@ def backup_excel():
     print("Backup:", backup.name)
 
 
-
-# ============================================================
-# CONTROLLED HISTORICAL TEST
-# ============================================================
-TEST_MODE = True
-TEST_START = datetime(2026, 9, 22, 0, 0, tzinfo=IST)
-TEST_END = datetime(2026, 9, 23, 0, 0, tzinfo=IST)
-TEST_NDTV_CANDIDATES = [
-    (
-        "https://www.ndtv.com/technology/oneplus-n6-lite-4g-launched-in-india-with-6-75-inch-display-7-000mah-battery-price-specifications-9342905",
-        "OnePlus N6 Lite 4G Launched in India With 6.75-Inch Display, 7,000mAh Battery: Price, Specifications",
-    )
-]
-
-def flipkart_variants(model):
-    """Secondary variant check. Never used to decide launch status."""
-    urls = [
-        "https://www.flipkart.com/search?q=" + urllib.parse.quote(model),
-        "https://www.flipkart.com/search?q=" + urllib.parse.quote(model + " 4GB 64GB"),
-    ]
-    out = []
-    pat = re.compile(r"(?:\(([^()]{2,45}),\s*(\d{2,4})\s*GB\)|\(([^()]{2,45}),\s*(\d{2,4})\s*GB\))", re.I)
-    ram_pat = re.compile(r"(\d{1,2})\s*GB\s*RAM", re.I)
-    try:
-        for url in urls:
-            html = get_html(url, timeout=20)
-            if not html:
-                continue
-            soup = BeautifulSoup(html, "html.parser")
-            text = clean(soup.get_text(" ", strip=True))
-            low = text.lower()
-            if model.lower() not in low:
-                continue
-            # Flipkart search text often presents: Model (Color, Storage) ... RAM.
-            for m in re.finditer(r"" + re.escape(model) + r"\s*\(([^,()]{2,45}),\s*(\d{2,4})\s*GB\)[^\n]{0,180}?([0-9]{1,2})\s*GB\s*RAM", text, re.I):
-                item = (clean(m.group(1)), f"{m.group(2)} GB", f"{m.group(3)} GB")
-                if item not in out:
-                    out.append(item)
-            if out:
-                break
-    except Exception:
-        pass
-    return out
-
 def main():
     print("=" * 70)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION")
-    print("NDTV + OFFICIAL INDIA BRAND + FLIPKART VARIANT VERIFICATION")
+    print("NDTV + GOOGLE NEWS DISCOVERY + OFFICIAL INDIA BRAND VERIFICATION ONLY")
     print("=" * 70)
 
     if not XLSX.exists():
@@ -672,133 +967,151 @@ def main():
 
     wb = load_workbook(XLSX)
     ws = wb["PRODUCT_DATA"]
+
     headers = [ws.cell(1, c).value for c in range(1, 21)]
     if headers != HEADERS:
         raise RuntimeError("RetailiX template headers do not match expected 20 columns.")
 
     cols = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
+
     existing = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
-        existing.add(tuple(str(row[cols[k] - 1] or "").strip().lower() for k in (
-            "productName", "brandName", "variant_Color", "variant_Storage", "variant_RAM"
-        )))
+        existing.add(tuple(
+            str(row[cols[k] - 1] or "").strip().lower()
+            for k in (
+                "productName", "brandName",
+                "variant_Color", "variant_Storage", "variant_RAM"
+            )
+        ))
 
-    if TEST_MODE:
-        start, end = TEST_START, TEST_END
-        print(f"TEST DATE WINDOW: {start.isoformat()} -> {end.isoformat()}")
-    else:
-        end = now()
-        start = end - timedelta(hours=24)
-        print(f"Window: {start.isoformat()} -> {end.isoformat()}")
+    TEST_DATE_START = datetime(2026, 9, 22, 0, 0, 0, tzinfo=IST)
+    TEST_DATE_END = datetime(2026, 9, 23, 0, 0, 0, tzinfo=IST)
+    start = TEST_DATE_START
+    end = TEST_DATE_END
+
+    print(f"TEST DATE WINDOW: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    if TEST_MODE:
-        candidates = TEST_NDTV_CANDIDATES
-        print("NDTV controlled test candidate: OnePlus N6 Lite 4G")
-    else:
-        candidates = ndtv_candidates()
-    print("NDTV candidates found:", len(candidates))
+    ndtv_results = ndtv_candidates()
+    print("NDTV candidates found:", len(ndtv_results))
 
+    google_results = google_news_candidates()
+    print("Google News candidates found:", len(google_results))
+
+    # Merge NDTV + Google News discovery results.
+    merged = {}
+    for url, title in ndtv_results:
+        merged[url] = title
+    for url, title in google_results:
+        merged.setdefault(url, title)
+
+    candidates = list(merged.items())
+    print("Combined discovery candidates:", len(candidates))
+
+    # Keep only the ten requested brands.
     grouped = {brand: [] for brand in BRANDS}
+
     for url, title in candidates:
         brand = candidate_brand(title)
-        if brand and (url, title) not in grouped[brand]:
+        if brand and url not in [x[0] for x in grouped[brand]]:
             grouped[brand].append((url, title))
 
     additions = []
 
     for brand, urls in grouped.items():
         print("\nChecking:", brand)
+
         if not urls:
-            print("  No NDTV candidate.")
+            print("  No NDTV/Google News candidate.")
             continue
 
         found_model = False
-        for ndtv_url, ndtv_title in urls:
+
+        for ndtv_url, ndtv_title in urls[:12]:
+            if found_model:
+                break
+
             html = get_html(ndtv_url)
-            ndtv_dt = article_date(html) if html else TEST_START
+            if not html:
+                continue
 
-            # The controlled test knows the NDTV article/date; if GitHub cannot
-            # fetch NDTV, do not let that network restriction block the test.
-            if TEST_MODE and brand == "ONEPLUS":
-                ndtv_dt = TEST_START
-                html = html or ""
-                print("  NDTV:", ndtv_title)
-                print("  Date:", ndtv_dt.isoformat())
-            else:
-                if not html or not qualifying_ndtv(ndtv_title, html, brand, start, end):
-                    continue
-                print("  NDTV:", ndtv_title)
-                print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
+            if not qualifying_ndtv(ndtv_title, html, brand, start, end):
+                continue
 
+            ndtv_dt = article_date(html)
             model_hint = model_from_ndtv(ndtv_title, brand)
+
+            print("  Discovery:", ndtv_title)
+            print("  Source URL:", ndtv_url)
+            print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
+
+            # Official launch confirmation + official product page.
             domains = BRANDS[brand]
 
-            # For the controlled OnePlus test, use the exact official India page.
-            if TEST_MODE and brand == "ONEPLUS":
-                official_url = "https://www.oneplus.in/n6-lite"
-                official_html = get_html(official_url)
-            else:
-                official_url, official_html = official_launch_confirmed(model_hint, brand, domains, html)
+            official_url, official_html = official_launch_confirmed(
+                model_hint, brand, domains, html
+            )
 
             if not official_url or not official_html:
                 print("  SKIPPED: official India confirmation not found.")
                 continue
 
+            print("  Official:", official_url)
+
             name = product_name_from_official(official_html, model_hint)
+
+            # Never use an NDTV article headline as the product name.
+            if name.lower() == ndtv_title.lower():
+                print("  SKIPPED: official page did not provide an exact product name.")
+                continue
+
             description = official_description(official_html, name)
-            variants = extract_variants(official_html, name)
-
-            # Flipkart is a secondary check. If it exposes exact variants, use
-            # only combinations it explicitly shows. Otherwise keep official
-            # OnePlus variants when the official page explicitly maps them.
-            fk = flipkart_variants(name)
-            if fk:
-                verified = [v for v in variants if v in fk]
-                if verified:
-                    variants = verified
-                    print("  Flipkart exact variants:", len(fk))
-                else:
-                    print("  Flipkart found no matching exact combination; keeping official data.")
-            else:
-                print("  Flipkart variant page unavailable; official data used.")
-
-            # OnePlus N6 Lite has one explicit configuration (4 GB + 64 GB)
-            # and two explicit colors on the same official product page.
-            if TEST_MODE and brand == "ONEPLUS" and name.lower().startswith("oneplus n6 lite"):
-                variants = [
-                    ("Neo Green", "64 GB", "4 GB"),
-                    ("Midnight Hype", "64 GB", "4 GB"),
-                ]
 
             if len(description) < 60:
                 print("  SKIPPED: official product description not verified.")
                 continue
+
+            variants = extract_variants(official_html, name)
+
             if not variants:
-                print("  SKIPPED: exact Color + Storage + RAM not verified.")
+                print("  SKIPPED: exact Color + Storage + RAM mapping not verified.")
                 continue
 
             images = official_images(official_html, official_url)
+
             if not images:
                 print("  SKIPPED: official product image not found.")
                 continue
 
             for color, storage, ram in variants:
-                key = (name.strip().lower(), brand.lower(), color.strip().lower(), storage.strip().lower(), ram.strip().lower())
+                key = (
+                    name.strip().lower(),
+                    brand.lower(),
+                    color.strip().lower(),
+                    storage.strip().lower(),
+                    ram.strip().lower(),
+                )
+
                 if key in existing:
                     continue
+
                 additions.append({
-                    "name": name, "brand": brand, "short": description[:500], "long": description[:2000],
-                    "color": color, "storage": storage, "ram": ram, "images": images
+                    "name": name,
+                    "brand": brand,
+                    "short": description[:500],
+                    "long": description[:2000],
+                    "color": color,
+                    "storage": storage,
+                    "ram": ram,
+                    "images": images,
                 })
+
                 existing.add(key)
 
-            print("  VERIFIED:", name)
-            print("  Official:", official_url)
+            print("  Product:", name)
             print("  Exact variants:", len(variants))
             print("  Official images:", len(images))
             found_model = True
-            break
 
         if not found_model:
             print("  No qualifying verified launch.")
@@ -809,12 +1122,37 @@ def main():
         return
 
     backup_excel()
+
     for p in additions:
         imgs = p["images"]
-        ws.append([p["name"], p["brand"], "Electronics", "Accessories", "piece", "NO TAX APPLIED", "NODISCOUNT0", "1 Year Warranty", p["short"], p["long"], "true", "false", p["color"], p["storage"], p["ram"], imgs[0] if len(imgs) > 0 else "", "true", imgs[1] if len(imgs) > 1 else "", imgs[2] if len(imgs) > 2 else "", imgs[3] if len(imgs) > 3 else ""])
+
+        ws.append([
+            p["name"],
+            p["brand"],
+            "Electronics",
+            "Accessories",
+            "piece",
+            "NO TAX APPLIED",
+            "NODISCOUNT0",
+            "1 Year Warranty",
+            p["short"],
+            p["long"],
+            "true",
+            "false",
+            p["color"],
+            p["storage"],
+            p["ram"],
+            imgs[0] if len(imgs) > 0 else "",
+            "true",
+            imgs[1] if len(imgs) > 1 else "",
+            imgs[2] if len(imgs) > 2 else "",
+            imgs[3] if len(imgs) > 3 else "",
+        ])
 
     wb.save(XLSX)
+
     print("\nRows added:", len(additions))
+    print("Rows skipped: verified duplicates / incomplete official data")
     print("AUTOMATION COMPLETED")
 
 
