@@ -33,14 +33,13 @@ BRANDS = {
 }
 
 NDTV_URLS = [
+    "https://www.ndtv.com/topic/launch",
+    "https://www.ndtv.com/topic/launches",
+    "https://www.ndtv.com/topic/launched",
     "https://www.ndtv.com/topic/smartphones",
     "https://www.ndtv.com/topic/mobile-phones",
     "https://www.ndtv.com/topic/smartphone",
     "https://www.ndtv.com/topic/phones",
-    "https://www.ndtv.com/topic/launch",
-    "https://www.ndtv.com/topic/launches",
-    "https://www.ndtv.com/topic/launched",
-    "https://www.ndtv.com/",
 ]
 
 HEADERS = [
@@ -161,64 +160,50 @@ def article_date(html):
 
 
 def ndtv_candidates():
-    """Discover recent smartphone launch stories from rendered NDTV pages.
+    """
+    NDTV is the only discovery layer.
 
-    NDTV pages can be dynamically rendered or expose Tech links through the
-    current NDTV/Gadgets 360 publishing structure, so use Playwright first and
-    requests as a fallback. Discovery is still limited to NDTV-owned pages.
+    Important: do NOT require launch wording in the headline. NDTV launch
+    stories sometimes put the actual launch wording in the article body.
+    We collect recent smartphone/phone articles first, then qualifying_ndtv()
+    checks the full article for launch wording and the exact 24-hour window.
     """
     out = {}
 
-    def collect(url, rendered_html):
-        soup = BeautifulSoup(rendered_html, "html.parser")
+    for base in NDTV_URLS:
+        html = get_html(base)
+        if not html:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+
         for a in soup.find_all("a", href=True):
-            u = normalize_url(a["href"], url)
+            url = normalize_url(a["href"], base)
             title = clean(a.get_text(" ", strip=True))
-            if not title:
-                title = clean(a.get("aria-label", ""))
+
+            if not url.startswith("https://www.ndtv.com/"):
+                continue
             if len(title) < 15:
                 continue
-            if not (u.startswith("https://www.ndtv.com/") or u.startswith("https://www.gadgets360.com/")):
+
+            path = urlparse(url).path.lower()
+            if not (path.startswith("/technology/") or path.startswith("/tech/") or "/mobiles/" in path or "/mobile/" in path):
                 continue
-            path = urlparse(u).path.lower()
-            if not (path.startswith("/technology/") or path.startswith("/tech/") or
-                    "/mobiles/news/" in path or "/mobile-phones/news/" in path):
-                continue
+
             blob = title.lower()
             if not any(x in blob for x in SMART_WORDS):
                 continue
+
+            # Avoid obvious non-launch content early, but do not reject a
+            # story merely because the headline lacks the word "launch".
             if any(x in blob for x in (
                 "review", "vs", "versus", "comparison", "price drop",
                 "discount", "deal", "offers", "best phones", "top phones",
                 "how to", "tips", "wallpaper", "case", "cover"
             )):
                 continue
-            out[u] = title
 
-    for base in NDTV_URLS:
-        html = ""
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) "
-                        "AppleWebKit/537.36 Chrome/140 Safari/537.36"
-                    )
-                )
-                page.goto(base, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(2500)
-                html = page.content()
-                browser.close()
-        except Exception:
-            html = ""
-
-        if html:
-            collect(base, html)
-        else:
-            fallback = get_html(base)
-            if fallback:
-                collect(base, fallback)
+            out[url] = title
 
     return [(u, t) for u, t in out.items()]
 
