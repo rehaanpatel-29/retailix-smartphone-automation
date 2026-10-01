@@ -671,17 +671,8 @@ def backup_excel():
 
 
 # ============================================================
-# CONTROLLED HISTORICAL TEST
+# PRODUCTION MODE
 # ============================================================
-TEST_MODE = True
-TEST_START = datetime(2026, 9, 22, 0, 0, tzinfo=IST)
-TEST_END = datetime(2026, 9, 23, 0, 0, tzinfo=IST)
-TEST_NDTV_CANDIDATES = [
-    (
-        "https://www.ndtv.com/technology/oneplus-n6-lite-4g-launched-in-india-with-6-75-inch-display-7-000mah-battery-price-specifications-9342905",
-        "OnePlus N6 Lite 4G Launched in India With 6.75-Inch Display, 7,000mAh Battery: Price, Specifications",
-    )
-]
 
 def flipkart_variants(model):
     """Secondary variant check. Never used to decide launch status."""
@@ -715,7 +706,7 @@ def flipkart_variants(model):
 
 def main():
     print("=" * 70)
-    print("RETAILIX DAILY SMARTPHONE AUTOMATION")
+    print("RETAILIX DAILY SMARTPHONE AUTOMATION - LIVE")
     print("NDTV + OFFICIAL INDIA BRAND + FLIPKART VARIANT VERIFICATION")
     print("=" * 70)
 
@@ -735,20 +726,12 @@ def main():
             "productName", "brandName", "variant_Color", "variant_Storage", "variant_RAM"
         )))
 
-    if TEST_MODE:
-        start, end = TEST_START, TEST_END
-        print(f"TEST DATE WINDOW: {start.isoformat()} -> {end.isoformat()}")
-    else:
-        end = now()
-        start = end - timedelta(hours=24)
-        print(f"Window: {start.isoformat()} -> {end.isoformat()}")
+    end = now()
+    start = end - timedelta(hours=24)
+    print(f"LIVE 24-HOUR WINDOW: {start.isoformat()} -> {end.isoformat()}")
     print("Existing combinations:", len(existing))
 
-    if TEST_MODE:
-        candidates = TEST_NDTV_CANDIDATES
-        print("NDTV controlled test candidate: OnePlus N6 Lite 4G")
-    else:
-        candidates = ndtv_candidates()
+    candidates = ndtv_candidates()
     print("NDTV candidates found:", len(candidates))
 
     grouped = {brand: [] for brand in BRANDS}
@@ -768,30 +751,16 @@ def main():
         found_model = False
         for ndtv_url, ndtv_title in urls:
             html = get_html(ndtv_url)
-            ndtv_dt = article_date(html) if html else TEST_START
+            if not html or not qualifying_ndtv(ndtv_title, html, brand, start, end):
+                continue
 
-            # The controlled test knows the NDTV article/date; if GitHub cannot
-            # fetch NDTV, do not let that network restriction block the test.
-            if TEST_MODE and brand == "ONEPLUS":
-                ndtv_dt = TEST_START
-                html = html or ""
-                print("  NDTV:", ndtv_title)
-                print("  Date:", ndtv_dt.isoformat())
-            else:
-                if not html or not qualifying_ndtv(ndtv_title, html, brand, start, end):
-                    continue
-                print("  NDTV:", ndtv_title)
-                print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
+            ndtv_dt = article_date(html)
+            print("  NDTV:", ndtv_title)
+            print("  Date:", ndtv_dt.isoformat() if ndtv_dt else "unknown")
 
             model_hint = model_from_ndtv(ndtv_title, brand)
             domains = BRANDS[brand]
-
-            # For the controlled OnePlus test, use the exact official India page.
-            if TEST_MODE and brand == "ONEPLUS":
-                official_url = "https://www.oneplus.in/n6-lite"
-                official_html = get_html(official_url)
-            else:
-                official_url, official_html = official_launch_confirmed(model_hint, brand, domains, html)
+            official_url, official_html = official_launch_confirmed(model_hint, brand, domains, html)
 
             if not official_url or not official_html:
                 print("  SKIPPED: official India confirmation not found.")
@@ -814,14 +783,6 @@ def main():
                     print("  Flipkart found no matching exact combination; keeping official data.")
             else:
                 print("  Flipkart variant page unavailable; official data used.")
-
-            # OnePlus N6 Lite has one explicit configuration (4 GB + 64 GB)
-            # and two explicit colors on the same official product page.
-            if TEST_MODE and brand == "ONEPLUS" and name.lower().startswith("oneplus n6 lite"):
-                variants = [
-                    ("Neo Green", "64 GB", "4 GB"),
-                    ("Midnight Hype", "64 GB", "4 GB"),
-                ]
 
             if len(description) < 60:
                 print("  SKIPPED: official product description not verified.")
