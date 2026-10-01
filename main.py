@@ -33,10 +33,22 @@ BRANDS = {
 }
 
 NDTV_URLS = [
+    # Primary smartphone/mobile discovery
     "https://www.ndtv.com/topic/smartphones",
     "https://www.ndtv.com/topic/mobile-phones",
     "https://www.ndtv.com/topic/smartphone",
     "https://www.ndtv.com/topic/phones",
+
+    # NDTV launch-focused discovery
+    "https://www.ndtv.com/topic/launch",
+    "https://www.ndtv.com/topic/launches",
+    "https://www.ndtv.com/topic/launched",
+
+    # Broad NDTV feeds used only for discovery; the 24-hour filter
+    # and smartphone/brand/launch checks below remain mandatory.
+    "https://www.ndtv.com/latest",
+    "https://www.ndtv.com/topic/technology",
+    "https://www.ndtv.com/topic/tech",
 ]
 
 HEADERS = [
@@ -824,7 +836,17 @@ def main():
     backup_excel()
     for p in additions:
         imgs = p["images"]
-        ws.append([p["name"], p["brand"], "Electronics", "Accessories", "piece", "NO TAX APPLIED", "NODISCOUNT0", "1 Year Warranty", p["short"], p["long"], "true", "false", p["color"], p["storage"], p["ram"], imgs[0] if len(imgs) > 0 else "", "true", imgs[1] if len(imgs) > 1 else "", imgs[2] if len(imgs) > 2 else "", imgs[3] if len(imgs) > 3 else ""])
+        ws.append([
+            p["name"], p["brand"], "Electronics", "Mobiles", "piece",
+            "NO TAX APPLIED", "", "NO WARRANTY APPLIED",
+            p["short"], p["long"], "true", "false",
+            p["color"], p["storage"], p["ram"],
+            imgs[0] if len(imgs) > 0 else "",
+            "true",
+            imgs[1] if len(imgs) > 1 else "",
+            imgs[2] if len(imgs) > 2 else "",
+            imgs[3] if len(imgs) > 3 else ""
+        ])
 
     wb.save(XLSX)
     print("\nRows added:", len(additions))
