@@ -33,22 +33,13 @@ BRANDS = {
 }
 
 NDTV_URLS = [
-    # Primary smartphone/mobile discovery
+    "https://www.ndtv.com/",
     "https://www.ndtv.com/topic/smartphones",
     "https://www.ndtv.com/topic/mobile-phones",
     "https://www.ndtv.com/topic/smartphone",
     "https://www.ndtv.com/topic/phones",
-
-    # NDTV launch-focused discovery
     "https://www.ndtv.com/topic/launch",
     "https://www.ndtv.com/topic/launches",
-    "https://www.ndtv.com/topic/launched",
-
-    # Broad NDTV feeds used only for discovery; the 24-hour filter
-    # and smartphone/brand/launch checks below remain mandatory.
-    "https://www.ndtv.com/latest",
-    "https://www.ndtv.com/topic/technology",
-    "https://www.ndtv.com/topic/tech",
 ]
 
 HEADERS = [
@@ -190,13 +181,29 @@ def ndtv_candidates():
             url = normalize_url(a["href"], base)
             title = clean(a.get_text(" ", strip=True))
 
-            if not url.startswith("https://www.ndtv.com/"):
+            # NDTV's Tech section is served through NDTV Gadgets 360.
+            # The NDTV homepage currently links its Tech stories to gadgets360.com,
+            # so accept that NDTV-owned Tech destination for discovery as well.
+            host = urlparse(url).netloc.lower().split(":")[0]
+            allowed_host = (
+                host == "www.ndtv.com"
+                or host.endswith(".ndtv.com")
+                or host == "www.gadgets360.com"
+                or host.endswith(".gadgets360.com")
+            )
+            if not allowed_host:
                 continue
             if len(title) < 15:
                 continue
 
             path = urlparse(url).path.lower()
-            if not (path.startswith("/technology/") or path.startswith("/tech/")):
+            tech_path = (
+                path.startswith("/technology/")
+                or path.startswith("/tech/")
+                or path.startswith("/mobiles/news/")
+                or path.startswith("/mobiles/")
+            )
+            if not tech_path:
                 continue
 
             blob = title.lower()
