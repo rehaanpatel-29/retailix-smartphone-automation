@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, quote_plus
 
@@ -126,6 +127,21 @@ MONTHS = (
     "January February March April May June July August "
     "September October November December"
 )
+
+
+def parse_rss_date(value):
+    """Parse an RSS/RFC-822 publication date into IST-aware datetime."""
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(str(value).strip())
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        return dt.astimezone(IST)
+    except (TypeError, ValueError, OverflowError):
+        return parse_date(value)
 
 
 def parse_date(text):
