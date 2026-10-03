@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import re
 import shutil
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, quote_plus
 
@@ -75,8 +76,8 @@ SELECTED_BRANDS_LOWER = {
     for brand, aliases in BRAND_ALIASES.items()
 }
 
-N91_LATEST_URL = "https://www.91mobiles.com/list-of-phones/latest-mobiles-in-india"
-G360_LATEST_URL = "https://www.gadgets360.com/mobiles/latest-phones"
+N91_NEWS_URL = "https://www.91mobiles.com/hub/category/news/"
+G360_MOBILE_RSS_URL = "https://www.gadgets360.com/rss/mobiles/feeds"
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -185,6 +186,39 @@ def parse_date(text):
 def date_only(dt):
     return dt.date() if dt else None
 
+def article_date(html):
+    soup = BeautifulSoup(html, "html.parser")
+
+    for attrs in (
+        {"property": "article:published_time"},
+        {"property": "og:article:published_time"},
+        {"name": "publish-date"},
+        {"name": "date"},
+        {"itemprop": "datePublished"},
+    ):
+        m = soup.find("meta", attrs=attrs)
+        if m:
+            value = m.get("content") or m.get("datetime")
+            if value:
+                try:
+                    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=IST)
+                    return dt.astimezone(IST)
+                except ValueError:
+                    parsed = parse_date(value)
+                    if parsed:
+                        return parsed
+
+    for tag in soup.find_all("time"):
+        value = tag.get("datetime") or tag.get_text(" ", strip=True)
+        parsed = parse_date(value)
+        if parsed:
+            return parsed
+
+    return None
+
+
 
 def get_release_window():
     """
@@ -254,226 +288,319 @@ def model_key(name):
 
 
 # ------------------------------------------------------------
-# 91MOBILES DISCOVERY
+# TWO-SOURCE LAUNCH DISCOVERY
 # ------------------------------------------------------------
 
-def parse_91mobiles_candidates():
-    """
-    Scrape the 91mobiles "Latest Mobiles in India" page.
+STRONG_LAUNCH_WORDS = (
+    "launched in india",
+    "has launched in india",
+    "launched in the indian market",
+    "launched in india today",
+    "launched in india on",
+    "launches in india",
+)
 
-    91mobiles exposes entries with:
-      - product name
-      - release date
-      - product link
+EXCLUDE_LAUNCH_WORDS = (
+    "upcoming",
+    "could launch",
+    "may launch",
+    "might launch",
+    "expected to launch",
+    "set to launch",
+    "ahead of india launch",
+    "before india launch",
+    "pre-launch",
+    "prelaunch",
+    "teased",
+    "tipped",
+    "rumour",
+    "rumor",
+    "leaked",
+    "coming soon",
+    "announced in india",
+    "announcement",
+    "will launch",
+)
 
-    We intentionally use the India page rather than an upcoming page.
+
+def article_is_real_india_launch(title, body):
+    blob = clean(f"{title} {body}").lower()
+
+    if any(x in blob for x in EXCLUDE_LAUNCH_WORDS):
+        return False
+
+    return any(x in blob for x in STRONG_LAUNCH_WORDS)
+
+
+def extract_launch_date_from_text(text, fallback):
     """
-    html = get_html(N91_LATEST_URL)
+    Try to extract an explicit India launch date from article text.
+    If the article says 'today' or doesn't give another explicit date,
+    use the article publication date as the launch-date candidate.
+    """
+    text = clean(text)
+
+    patterns = [
+        r"(?:launched|launches|launch)\s+in\s+india\s+(?:on\s+)?"
+        r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+20\d{2})",
+        r"(?:launched|launches|launch)\s+in\s+india\s+(?:on\s+)?"
+        r"([A-Za-z]+\s+\d{1,2},\s*20\d{2})",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            value = re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group(1))
+            dt = parse_date(value)
+            if dt:
+                return dt
+
+    return fallback
+
+
+def parse_91mobiles_news_candidates():
+    """
+    91mobiles NEWS is used as the discovery source, not the
+    'latest phones' database.
+
+    This matters because the latest-phone list can be paginated/
+    popularity-sorted and may not expose a newly launched phone
+    in its first server-rendered batch.
+    """
+    html = get_html(N91_NEWS_URL)
     if not html:
-        print("91mobiles: page unavailable.")
+        print("91mobiles: news page unavailable.")
         return []
 
     soup = BeautifulSoup(html, "html.parser")
     candidates = {}
+    seen_urls = set()
 
-    # Primary method: locate links that point to phone detail pages.
     for a in soup.find_all("a", href=True):
-        href = normalize_url(a["href"], N91_LATEST_URL)
-        text = clean(a.get_text(" ", strip=True))
+        href = normalize_url(a["href"], N91_NEWS_URL)
+        title = clean(a.get_text(" ", strip=True))
 
         if "91mobiles.com" not in urlparse(href).netloc.lower():
             continue
-        if "/mobile/" not in href.lower():
+        if "/hub/" not in href.lower():
             continue
-        if len(text) < 2:
+        if len(title) < 20:
+            continue
+        if href in seen_urls:
             continue
 
-        # Inspect the closest useful container for release-date text.
-        node = a
-        container_text = ""
-        for _ in range(5):
-            node = node.parent
-            if not node:
-                break
-            candidate_text = clean(node.get_text(" ", strip=True))
-            if len(candidate_text) <= 3000:
-                container_text = candidate_text
-                if re.search(r"(?:new\s+)?release\s+date", candidate_text, re.I):
-                    break
+        seen_urls.add(href)
 
-        release = None
-
-        # Prefer "New Release Date" / "Release Date" immediately around the card.
-        date_match = re.search(
-            r"(?:new\s+)?release\s+date\s*[:\-]?\s*"
-            r"(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2})",
-            container_text,
-            re.I,
-        )
-        if date_match:
-            release = parse_date(date_match.group(1))
-
-        if not release:
-            date_match = re.search(
-                r"(?:new\s+)?release\s+date\s*[:\-]?\s*"
-                r"(\d{1,2}[/-]\d{1,2}[/-]20\d{2})",
-                container_text,
-                re.I,
+        # Only process articles likely to concern smartphones.
+        if not any(
+            word in title.lower()
+            for word in (
+                "phone", "smartphone", "iphone", "galaxy", "redmi",
+                "poco", "oneplus", "oppo", "vivo", "realme",
+                "motorola", "moto", "infinix",
             )
-            if date_match:
-                release = parse_date(date_match.group(1))
-
-        if not release:
+        ):
             continue
 
-        brand = detect_brand(text)
+        article_html = get_html(href, timeout=25)
+        if not article_html:
+            continue
+
+        published = article_date(article_html)
+        if not published:
+            # 91mobiles commonly exposes the publication date in text.
+            page_text = clean(
+                BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
+            )
+            published = parse_date(page_text)
+
+        if not published:
+            continue
+
+        # Only fetch/parse articles near the requested date window.
+        # A small buffer is used because publication and launch wording
+        # can differ by a few hours.
+        body = clean(
+            BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
+        )
+
+        if not article_is_real_india_launch(title, body):
+            continue
+
+        brand = detect_brand(title) or detect_brand(body[:12000])
         if not brand:
-            brand = detect_brand(container_text)
-
-        if not brand:
             continue
 
-        name = normalize_model_name(text, brand)
-        if not name or len(name) < 3:
+        # Keep launch-related articles only; exclude reviews, deals,
+        # price changes and variant-only updates.
+        low = f"{title} {body[:5000]}".lower()
+        if any(
+            x in low
+            for x in (
+                "price hike", "price cut", "deal", "discount",
+                "review", "first impressions", "comparison",
+                "new ram and storage variant", "storage variant",
+            )
+        ):
             continue
 
-        key = model_key(name)
-        if not key:
+        model = normalize_model_name(title, brand)
+        if not model:
             continue
 
-        # Ignore obviously upcoming cards if the page marks them.
-        low_container = container_text.lower()
-        if "(upcoming)" in low_container or "upcoming" in low_container:
-            continue
+        launch_date = extract_launch_date_from_text(body, published)
+        key = (brand, model_key(model))
 
         candidates[key] = {
             "brand": brand,
-            "name": name,
-            "release": release,
+            "name": model,
+            "release": launch_date,
             "url": href,
             "source": "91mobiles",
+            "article_date": published,
         }
 
     return list(candidates.values())
 
 
-# ------------------------------------------------------------
-# GADGETS 360 DISCOVERY
-# ------------------------------------------------------------
-
-def parse_gadgets360_candidates():
+def parse_gadgets360_rss_candidates():
     """
-    Scrape the Gadgets 360 latest-phone database.
-
-    The page exposes product names and release dates.  We use it as
-    the second independent discovery/cross-check source.
+    Gadgets 360 provides an official Mobiles RSS feed. RSS is much
+    more stable for GitHub Actions than scraping the latest-phone
+    database, which can return an anti-bot/empty response.
     """
-    html = get_html(G360_LATEST_URL)
-    if not html:
-        print("Gadgets 360: page unavailable.")
+    xml = get_html(G360_MOBILE_RSS_URL, timeout=30)
+    if not xml:
+        print("Gadgets 360: mobile RSS unavailable.")
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
-    candidates = {}
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        print("Gadgets 360: invalid RSS response.")
+        return []
 
-    for a in soup.find_all("a", href=True):
-        href = normalize_url(a["href"], G360_LATEST_URL)
-        text = clean(a.get_text(" ", strip=True))
+    candidates = []
 
-        if "gadgets360.com" not in urlparse(href).netloc.lower():
-            continue
-        if "/mobiles/" not in href.lower():
-            continue
-        if len(text) < 2:
-            continue
+    for item in root.findall(".//item"):
+        title = clean(item.findtext("title"))
+        link = clean(item.findtext("link"))
+        pub_text = clean(item.findtext("pubDate"))
+        description = clean(item.findtext("description"))
 
-        node = a
-        container_text = ""
-        for _ in range(6):
-            node = node.parent
-            if not node:
-                break
-            candidate_text = clean(node.get_text(" ", strip=True))
-            if len(candidate_text) <= 3500:
-                container_text = candidate_text
-                if re.search(r"release\s+date", candidate_text, re.I):
-                    break
-
-        release = None
-        m = re.search(
-            r"release\s+date\s*[:\-]?\s*"
-            r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+20\d{2})",
-            container_text,
-            re.I,
-        )
-        if m:
-            release = parse_date(re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group(1)))
-
-        if not release:
-            m = re.search(
-                r"release\s+date\s*[:\-]?\s*"
-                r"(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2})",
-                container_text,
-                re.I,
-            )
-            if m:
-                release = parse_date(m.group(1))
-
-        if not release:
+        if not title or not link:
             continue
 
-        brand = detect_brand(text) or detect_brand(container_text)
+        brand = detect_brand(title)
         if not brand:
             continue
 
-        name = normalize_model_name(text, brand)
-        if not name or len(name) < 3:
+        if not any(
+            word in title.lower()
+            for word in (
+                "phone", "smartphone", "iphone", "galaxy", "redmi",
+                "poco", "oneplus", "oppo", "vivo", "realme",
+                "motorola", "moto", "infinix",
+            )
+        ):
             continue
 
-        key = model_key(name)
-        if not key:
+        published = parse_rss_date(pub_text)
+        if not published:
             continue
 
-        low_container = container_text.lower()
-        if "upcoming" in low_container:
+        # Fetch the article to distinguish an actual India launch
+        # from a rumour, upcoming launch, review, deal, or variant update.
+        article_html = get_html(link, timeout=25)
+        body = description
+
+        if article_html:
+            article_body = clean(
+                BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
+            )
+            if len(article_body) > len(body):
+                body = article_body
+
+        if not article_is_real_india_launch(title, body):
             continue
 
-        candidates[key] = {
+        low = f"{title} {body[:5000]}".lower()
+        if any(
+            x in low
+            for x in (
+                "ahead of india launch", "could launch", "may launch",
+                "expected to launch", "price hike", "price cut",
+                "deal", "discount", "review", "first impressions",
+                "comparison", "variant",
+            )
+        ):
+            continue
+
+        model = normalize_model_name(title, brand)
+        launch_date = extract_launch_date_from_text(body, published)
+
+        candidates.append({
             "brand": brand,
-            "name": name,
-            "release": release,
-            "url": href,
+            "name": model,
+            "release": launch_date,
+            "url": link,
             "source": "gadgets360",
-        }
+            "article_date": published,
+        })
 
-    return list(candidates.values())
+    # De-duplicate.
+    out = {}
+    for item in candidates:
+        key = (item["brand"], model_key(item["name"]))
+        out[key] = item
+
+    return list(out.values())
+
+
+def parse_rss_date(value):
+    if not value:
+        return None
+
+    from email.utils import parsedate_to_datetime
+
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        return dt.astimezone(IST)
+    except (TypeError, ValueError, OverflowError):
+        return parse_date(value)
 
 
 def discover_launches(start, end):
     """
-    A phone qualifies for discovery when:
-      - it is in the selected brands;
-      - 91mobiles has an India release date in the previous 24h;
-      - Gadgets 360 also has the same model with a release date in the
-        previous 24h.
+    Discovery rule:
 
-    We use model/date matching rather than requiring either site to link
-    to the other.
+      1. 91mobiles and Gadgets 360 independently report the phone
+         as actually launched in India.
+      2. Their India launch dates must agree.
+      3. Only selected brands and the requested date window qualify.
+
+    We no longer scrape the 'latest phones' databases. The databases
+    are useful for reference, but their visible ordering/pagination
+    can hide a newly launched phone. News feeds are used for discovery.
     """
-    n91 = parse_91mobiles_candidates()
-    g360 = parse_gadgets360_candidates()
+    n91 = parse_91mobiles_news_candidates()
+    g360 = parse_gadgets360_rss_candidates()
 
-    print("91mobiles candidates:", len(n91))
-    print("Gadgets 360 candidates:", len(g360))
+    print("91mobiles launch candidates:", len(n91))
+    print("Gadgets 360 launch candidates:", len(g360))
 
-    g360_map = {}
-    for item in g360:
-        g360_map[(item["brand"], model_key(item["name"]))] = item
+    g360_map = {
+        (item["brand"], model_key(item["name"])): item
+        for item in g360
+    }
 
     qualified = []
 
     for item in n91:
         release = item["release"]
+
         if not (start <= release <= end):
             continue
 
@@ -483,11 +610,10 @@ def discover_launches(start, end):
         if not other:
             print(
                 f"  CROSS-CHECK WAIT: {item['brand']} {item['name']} "
-                f"({release.date()}) not present on Gadgets 360."
+                f"({release.date()}) not confirmed by Gadgets 360."
             )
             continue
 
-        # Both sources must agree on the calendar release date.
         if date_only(other["release"]) != date_only(release):
             print(
                 f"  DATE MISMATCH: {item['name']} | "
@@ -499,11 +625,12 @@ def discover_launches(start, end):
         item["g360_url"] = other["url"]
         item["g360_release"] = other["release"]
         item["discovery_date"] = release
+
         qualified.append(item)
 
         print(
             f"  QUALIFIED: {item['brand']} {item['name']} | "
-            f"India release: {release.date()}"
+            f"India launch date: {release.date()}"
         )
 
     return qualified
