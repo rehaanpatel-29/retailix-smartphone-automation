@@ -4,7 +4,14 @@ on:
   schedule:
     # 12:00 AM IST = 18:30 UTC
     - cron: "30 18 * * *"
+
   workflow_dispatch:
+    inputs:
+      test_date:
+        description: "Optional test date (YYYY-MM-DD). Leave blank for normal previous-24h mode."
+        required: false
+        default: ""
+        type: string
 
 # Prevent two runs from modifying the same Excel file at the same time.
 concurrency:
@@ -13,6 +20,9 @@ concurrency:
 
 permissions:
   contents: write
+
+env:
+  RETAILIX_TEST_DATE: ${{ inputs.test_date }}
 
 jobs:
   run-automation:
