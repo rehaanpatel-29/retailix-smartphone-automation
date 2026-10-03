@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import re
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -183,6 +184,33 @@ def parse_date(text):
 
 def date_only(dt):
     return dt.date() if dt else None
+
+
+def get_release_window():
+    """
+    Production: previous rolling 24 hours.
+
+    Test mode: set RETAILIX_TEST_DATE=YYYY-MM-DD to inspect one full
+    India calendar day without changing production behaviour.
+    Example: RETAILIX_TEST_DATE=2026-10-01
+    """
+    test_date = os.getenv("RETAILIX_TEST_DATE", "").strip()
+
+    if test_date:
+        try:
+            day = datetime.strptime(test_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise RuntimeError(
+                "RETAILIX_TEST_DATE must use YYYY-MM-DD, e.g. 2026-10-01"
+            ) from exc
+
+        start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
+        end = start + timedelta(days=1) - timedelta(microseconds=1)
+        return start, end, True
+
+    end = now()
+    start = end - timedelta(hours=24)
+    return start, end, False
 
 
 # ------------------------------------------------------------
@@ -981,13 +1009,19 @@ def main():
 
     existing = load_existing(ws)
 
-    end = now()
-    start = end - timedelta(hours=24)
+    start, end, test_mode = get_release_window()
 
-    print(
-        f"24-HOUR INDIA RELEASE WINDOW: "
-        f"{start.isoformat()} -> {end.isoformat()}"
-    )
+    if test_mode:
+        print(
+            "TEST MODE ENABLED: checking the full India calendar day "
+            f"{start.date()}"
+        )
+    else:
+        print(
+            f"24-HOUR INDIA RELEASE WINDOW: "
+            f"{start.isoformat()} -> {end.isoformat()}"
+        )
+
     print("Existing combinations:", len(existing))
 
     # --------------------------------------------------------
@@ -996,8 +1030,14 @@ def main():
     launches = discover_launches(start, end)
 
     if not launches:
-        print("\nNo selected-brand phone was independently confirmed")
-        print("by BOTH 91mobiles and Gadgets 360 in the last 24 hours.")
+        if test_mode:
+            print(
+                f"\nNo selected-brand phone was independently confirmed "
+                f"by BOTH 91mobiles and Gadgets 360 on {start.date()}."
+            )
+        else:
+            print("\nNo selected-brand phone was independently confirmed")
+            print("by BOTH 91mobiles and Gadgets 360 in the last 24 hours.")
         print("AUTOMATION COMPLETED - NO EXCEL CHANGES.")
         return
 
