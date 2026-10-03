@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -731,81 +733,178 @@ GADGETS360_URLS = [
 ]
 
 
-def get_gadgets360_article_links():
+# ------------------------------------------------------------
+# DIRECT GADGETS 360 RSS DISCOVERY
+# ------------------------------------------------------------
+
+GADGETS360_MOBILES_RSS = (
+    "https://www.gadgets360.com/rss/mobiles/feeds"
+)
+
+
+def parse_rss_date(value):
+
+    if not value:
+        return None
+
+    try:
+        dt = parsedate_to_datetime(
+            str(value).strip()
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=IST
+            )
+
+        return dt.astimezone(IST)
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return parse_date(value)
+
+
+def get_gadgets360_article_links(
+    start,
+    end,
+):
 
     links = []
 
-    for page_url in GADGETS360_URLS:
+    try:
 
-        html = get_html(
-            page_url,
+        response = SESSION.get(
+            GADGETS360_MOBILES_RSS,
             timeout=30,
         )
 
-        if not html:
-            continue
+        if not response.ok:
+            print(
+                "Gadgets 360 RSS request failed:",
+                response.status_code,
+            )
+            return links
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser",
+        xml = response.text
+
+    except requests.RequestException as exc:
+
+        print(
+            "Gadgets 360 RSS request error:",
+            exc,
         )
 
-        for a in soup.find_all(
-            "a",
-            href=True,
+        return links
+
+    try:
+
+        root = ET.fromstring(
+            xml
+        )
+
+    except ET.ParseError:
+
+        print(
+            "Gadgets 360 RSS XML could not be parsed."
+        )
+
+        return links
+
+    for item in root.findall(
+        ".//item"
+    ):
+
+        title = clean(
+            item.findtext(
+                "title"
+            )
+        )
+
+        url = clean(
+            item.findtext(
+                "link"
+            )
+        )
+
+        pub_date_text = clean(
+            item.findtext(
+                "pubDate"
+            )
+        )
+
+        if not url:
+            continue
+
+        parsed_url = urlparse(
+            url
+        )
+
+        if (
+            "gadgets360.com"
+            not in parsed_url.netloc.lower()
         ):
+            continue
 
-            href = normalize_url(
-                a.get("href"),
-                page_url,
-            )
+        path = (
+            parsed_url.path
+            .lower()
+        )
 
-            if not href:
-                continue
+        if not path.startswith(
+            "/mobiles/news/"
+        ):
+            continue
 
-            parsed = urlparse(href)
+        published = parse_rss_date(
+            pub_date_text
+        )
 
-            if (
-                "gadgets360.com"
-                not in parsed.netloc.lower()
-            ):
-                continue
+        if not published:
+            continue
 
-            path = parsed.path.lower()
+        # Only inspect articles from the requested
+        # production/test window.
+        if not (
+            start
+            <= published
+            <= end
+        ):
+            continue
 
-            if not path.startswith(
-                "/mobiles/news/"
-            ):
-                continue
+        links.append(
+            {
+                "url": normalize_url(url),
+                "title": title,
+                "published": published,
+            }
+        )
 
-            text = clean(
-                a.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            links.append(
-                (href, text)
-            )
-
+    # Remove duplicate URLs
     seen = set()
     result = []
 
-    for href, text in links:
+    for item in links:
 
-        if href in seen:
+        url = item["url"]
+
+        if url in seen:
             continue
 
-        seen.add(href)
+        seen.add(url)
 
         result.append(
-            (href, text)
+            item
         )
 
+    print(
+        "Gadgets 360 RSS articles in window:",
+        len(result),
+    )
+
     return result
-
-
 # ------------------------------------------------------------
 # VERIFY A PUBLISHER ARTICLE
 # ------------------------------------------------------------
@@ -965,19 +1064,35 @@ def discover_source_candidates(
             get_91mobiles_article_links()
         )
 
+        normalized_links = []
+
+        for url, title in raw_links:
+
+            normalized_links.append({
+                "url": url,
+                "title": title,
+                "published": None,
+            })
+
     else:
 
-        raw_links = (
-            get_gadgets360_article_links()
+        normalized_links = (
+            get_gadgets360_article_links(
+                start,
+                end,
+            )
         )
 
     out = {}
 
-    for url, title in raw_links:
+    for item in normalized_links:
 
         candidate = {
-            "url": url,
-            "title": title,
+            "url": item["url"],
+            "title": item["title"],
+            "published": item.get(
+                "published"
+            ),
             "source": source,
         }
 
@@ -997,7 +1112,9 @@ def discover_source_candidates(
             ),
         )
 
-        previous = out.get(key)
+        previous = out.get(
+            key
+        )
 
         if (
             previous is None
