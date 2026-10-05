@@ -289,6 +289,17 @@ def normalize_model_name(name, brand=None):
         maxsplit=1,
         flags=re.I,
     )[0]
+
+    # G360 headlines frequently use an SEO form such as
+    # "Samsung Galaxy A08 Price in India, Launch, Availability...".
+    # Strip those editorial suffixes so the same model can be matched
+    # against a 91mobiles headline such as "Samsung Galaxy A08 launched...".
+    name = re.split(
+        r"\s+(?:price|specifications?|features?|availability|launch|sale)\b",
+        name,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
     name = re.sub(r"\s*[:|,-]\s*$", "", name)
     name = re.sub(r"\s+", " ", name).strip(" -:|,")
     name = re.sub(r"^(?:the|new)\s+", "", name, flags=re.I)
@@ -674,49 +685,68 @@ def get_gadgets360_news_links():
     return candidates
 
 
-def get_gadgets360_official_mirror_links():
-    """Get G360 article links from official G360 mirror/subdomains."""
-    candidates = []
-    seen = set()
-
-    # Turbo is preferred because it is English and therefore works best with
-    # the existing launch-language verifier. Hindi is a secondary official
-    # discovery source.
-    for listing_url in (GADGETS360_TURBO_LIST, GADGETS360_HINDI_NEWS):
-        html = get_html(listing_url, timeout=30)
-        if not html:
+def _append_gadgets360_mirror_links_from_html(html, listing_url, candidates, seen):
+    """Extract first-party G360 article links from an HTML listing."""
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = normalize_url(a.get("href"), listing_url)
+        title = clean(a.get_text(" ", strip=True))
+        if not href or href in seen or len(title) < 20:
             continue
 
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = normalize_url(a.get("href"), listing_url)
-            title = clean(a.get_text(" ", strip=True))
-            if not href or href in seen or len(title) < 20:
-                continue
+        parsed = urlparse(href)
+        host = parsed.netloc.lower().split(":")[0]
+        path = parsed.path.lower()
+        if host not in GADGETS360_OFFICIAL_HOSTS:
+            continue
 
+        is_article = (
+            (host in {"www.gadgets360.com", "gadgets360.com"} and path.startswith("/mobiles/news/"))
+            or (host == "turbo.gadgets360.com" and "/mobiles/" in path)
+            or (host == "hindi.gadgets360.com" and path.startswith("/mobiles/"))
+        )
+        if not is_article:
+            continue
+
+        seen.add(href)
+        candidates.append({
+            "title": title,
+            "url": href,
+            "published": None,
+            "source": "gadgets360",
+        })
+
+
+def _append_gadgets360_mirror_links_from_jina(text, candidates, seen):
+    """Extract first-party G360 mirror links from Jina's rendered listing."""
+    patterns = [
+        r"\[([^\]]{10,220})\]\((https?://(?:turbo\.|hindi\.)?gadgets360\.com/[^)]+)\)",
+        r"https?://(?:turbo\.|hindi\.)?gadgets360\.com/[^\s)\]]+",
+    ]
+
+    for index, pattern in enumerate(patterns):
+        for match in re.finditer(pattern, text, re.I):
+            if index == 0:
+                title = clean(match.group(1))
+                href = normalize_url(match.group(2).rstrip(".,;"))
+            else:
+                title = ""
+                href = normalize_url(match.group(0).rstrip(".,;"))
+
+            if not href or href in seen:
+                continue
             parsed = urlparse(href)
             host = parsed.netloc.lower().split(":")[0]
             path = parsed.path.lower()
-
             if host not in GADGETS360_OFFICIAL_HOSTS:
                 continue
-
-            is_article = (
-                (
-                    host in {"www.gadgets360.com", "gadgets360.com"}
-                    and path.startswith("/mobiles/news/")
-                )
-                or (
-                    host == "turbo.gadgets360.com"
-                    and "/mobiles/" in path
-                )
-                or (
-                    host == "hindi.gadgets360.com"
-                    and path.startswith("/mobiles/")
-                )
-            )
-
-            if not is_article:
+            if not (
+                (host in {"www.gadgets360.com", "gadgets360.com"} and path.startswith("/mobiles/news/"))
+                or (host == "turbo.gadgets360.com" and "/mobiles/" in path)
+                or (host == "hindi.gadgets360.com" and path.startswith("/mobiles/"))
+            ):
+                continue
+            if title and len(title) < 20:
                 continue
 
             seen.add(href)
@@ -726,6 +756,33 @@ def get_gadgets360_official_mirror_links():
                 "published": None,
                 "source": "gadgets360",
             })
+
+
+def get_gadgets360_official_mirror_links():
+    """Get G360 article links from official G360 mirrors, with Jina transport fallback."""
+    candidates = []
+    seen = set()
+
+    # Turbo is preferred because it is English and works best with the launch
+    # verifier. Hindi is a secondary first-party discovery source.
+    for listing_url in (GADGETS360_TURBO_LIST, GADGETS360_HINDI_NEWS):
+        html = get_html(listing_url, timeout=30)
+        if html:
+            _append_gadgets360_mirror_links_from_html(html, listing_url, candidates, seen)
+
+    if candidates:
+        return candidates
+
+    # GitHub Actions may block both the main and mirror hosts. Jina Reader is
+    # used only as a transport layer to render the OFFICIAL G360 mirror pages;
+    # we still extract and verify only first-party G360 URLs.
+    for listing_url in (GADGETS360_TURBO_LIST, GADGETS360_HINDI_NEWS):
+        jina = jina_read_url(listing_url)
+        if not jina:
+            continue
+        _append_gadgets360_mirror_links_from_jina(
+            jina.get("content", ""), candidates, seen
+        )
 
     return candidates
 
@@ -807,7 +864,7 @@ def direct_source_candidates(source, start, end, test_mode):
                 print("Gadgets 360 Mobiles News page via Jina:", len(candidates))
                 return candidates
 
-        print("Gadgets 360 Mobiles News page unavailable.")
+        print("Gadgets 360 direct, official mirrors, and Jina listing fallbacks unavailable.")
         return []
 
     candidates = []
