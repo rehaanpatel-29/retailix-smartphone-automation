@@ -358,6 +358,8 @@ SMARTPHONE_TITLE_WORDS = (
 
 GADGETS360_MOBILES_RSS = "https://www.gadgets360.com/rss/mobiles/feeds"
 GADGETS360_MOBILES_NEWS = "https://www.gadgets360.com/mobiles/news"
+JINA_READER_BASE = "https://r.jina.ai/"
+JINA_SEARCH_BASE = "https://s.jina.ai/"
 NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
 NINETYONE_MAX_PAGES = 5
 
@@ -421,6 +423,23 @@ def parse_publisher_listing_date(text):
     return parse_date(text)
 
 
+def extract_published_date_from_text(text):
+    """Extract a publisher Published/Updated date from Jina's text output."""
+    text = clean(text)
+    patterns = [
+        r"(?:published|updated)(?:\s+on|\s*:)?\s+(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2})",
+        r"(?:published|updated)(?:\s+on|\s*:)?\s+([A-Za-z]+\s+\d{1,2},\s*20\d{2})",
+        r"(?:published|updated)(?:\s+on|\s*:)?\s+(\d{1,2}[/-]\d{1,2}[/-]20\d{2})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            dt = parse_date(m.group(1))
+            if dt:
+                return dt
+    return None
+
+
 def parse_gadgets360_rss(xml):
     """Parse the official Gadgets 360 Mobiles RSS feed."""
     try:
@@ -451,6 +470,110 @@ def parse_gadgets360_rss(xml):
         })
 
     return candidates
+
+
+def jina_read_url(url, timeout=45):
+    """Read a URL through Jina Reader when the GitHub runner cannot fetch it directly."""
+    if not url:
+        return None
+
+    reader_url = JINA_READER_BASE + url
+    try:
+        response = SESSION.get(
+            reader_url,
+            timeout=timeout,
+            headers={
+                "Accept": "application/json",
+                "X-Retain-Links": "true",
+                "X-With-Links-Summary": "true",
+            },
+        )
+        if not response.ok or len(response.text) < 100:
+            return None
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return {
+                "url": url,
+                "title": "",
+                "content": response.text,
+            }
+
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if not isinstance(data, dict):
+            return None
+
+        content = clean(data.get("content", ""))
+        title = clean(data.get("title", ""))
+        final_url = clean(data.get("url", "")) or url
+
+        if not content:
+            return None
+
+        return {
+            "url": final_url,
+            "title": title,
+            "content": content,
+        }
+    except requests.RequestException:
+        return None
+
+
+def jina_search(query, timeout=45):
+    """Search the web through Jina and return normalized result dictionaries."""
+    if not query:
+        return []
+
+    search_url = JINA_SEARCH_BASE + quote_plus(query)
+    try:
+        response = SESSION.get(
+            search_url,
+            timeout=timeout,
+            headers={
+                "Accept": "application/json",
+            },
+        )
+        if not response.ok or len(response.text) < 50:
+            return []
+
+        results = []
+        try:
+            payload = response.json()
+        except ValueError:
+            # Jina can return readable Markdown. Extract the source URLs
+            # directly from Markdown links as a fallback.
+            for match in re.finditer(
+                r"\[[^\]]+\]\((https?://[^)]+)\)", response.text
+            ):
+                results.append({
+                    "title": "",
+                    "url": normalize_url(match.group(1)),
+                    "published": None,
+                })
+            return results
+
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(data, dict):
+            data = data.get("results", data.get("items", []))
+        if not isinstance(data, list):
+            return []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            url = normalize_url(item.get("url", ""))
+            if not url:
+                continue
+            results.append({
+                "title": clean(item.get("title", "")),
+                "url": url,
+                "published": parse_date(item.get("published", "")),
+            })
+
+        return results
+    except requests.RequestException:
+        return []
 
 
 def parse_91mobiles_category(html):
@@ -553,9 +676,63 @@ def direct_source_candidates(source, start, end, test_mode):
         page_candidates = get_gadgets360_news_links()
         if page_candidates:
             print("Gadgets 360 Mobiles News page candidates:", len(page_candidates))
-        else:
-            print("Gadgets 360 Mobiles News page unavailable.")
-        return page_candidates
+            return page_candidates
+
+        # Last direct-source fallback: read the official G360 Mobiles News
+        # page through Jina and extract only G360 /mobiles/news/ links.
+        jina = jina_read_url(GADGETS360_MOBILES_NEWS)
+        if jina:
+            text = jina.get("content", "")
+            candidates = []
+            seen = set()
+
+            # Jina normally preserves publisher links as Markdown. Capture
+            # both the article title and the exact G360 URL so the normal
+            # brand/title pre-filter can work before article verification.
+            for match in re.finditer(
+                r"\[([^\]]{10,200})\]\((https?://(?:www\.)?gadgets360\.com/mobiles/news/[^)]+)\)",
+                text,
+                re.I,
+            ):
+                title = clean(match.group(1))
+                href = normalize_url(match.group(2).rstrip(".,;"))
+                if not href or href in seen:
+                    continue
+                if len(title) < 20:
+                    continue
+                seen.add(href)
+                candidates.append({
+                    "title": title,
+                    "url": href,
+                    "published": None,
+                    "source": "gadgets360",
+                })
+
+            # If the response contains bare URLs instead of Markdown links,
+            # retain them as a secondary locator.
+            if not candidates:
+                for match in re.finditer(
+                    r"https?://(?:www\.)?gadgets360\.com/mobiles/news/[^\s)\]]+",
+                    text,
+                    re.I,
+                ):
+                    href = normalize_url(match.group(0).rstrip(".,;"))
+                    if not href or href in seen:
+                        continue
+                    seen.add(href)
+                    candidates.append({
+                        "title": "",
+                        "url": href,
+                        "published": None,
+                        "source": "gadgets360",
+                    })
+
+            if candidates:
+                print("Gadgets 360 Mobiles News page via Jina:", len(candidates))
+                return candidates
+
+        print("Gadgets 360 Mobiles News page unavailable.")
+        return []
 
     candidates = []
     seen = set()
@@ -584,20 +761,40 @@ def verify_publisher_article(candidate, brand, start, end):
     if not url:
         return None
 
+    title = candidate.get("title", "")
+    publisher_title = ""
+    body = ""
+    published = None
+
+    # G360 is frequently blocked from GitHub-hosted runners. Try the real
+    # publisher URL first; if that fails, use Jina Reader only as a transport
+    # layer to fetch the SAME G360 article. The source remains G360.
     html = get_html(url, timeout=30)
-    if not html:
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        body = clean(soup.get_text(" ", strip=True))
+        h1 = soup.find("h1")
+        publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
+        published = article_date(html) or candidate.get("published")
+    elif candidate.get("source") == "gadgets360":
+        jina = jina_read_url(url)
+        if jina:
+            body = clean(jina.get("content", ""))
+            publisher_title = clean(jina.get("title", "")) or title
+            published = (
+                parse_date(jina.get("published", ""))
+                or candidate.get("published")
+                or extract_published_date_from_text(body[:12000])
+            )
+            print("  G360 article fetched via Jina:", url)
+        else:
+            return None
+    else:
         return None
 
-    soup = BeautifulSoup(html, "html.parser")
-    body = clean(soup.get_text(" ", strip=True))
-    title = candidate.get("title", "")
-
-    h1 = soup.find("h1")
-    publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
     if len(publisher_title) < 10:
         publisher_title = title
 
-    published = article_date(html) or candidate.get("published")
     if not published:
         return None
 
@@ -666,9 +863,9 @@ def discover_source_candidates(source, start, end, test_mode):
 
 def gadgets360_fallback_candidates(n91_candidates, start, end):
     """
-    Locate G360 articles when both RSS and the G360 news page are blocked.
-    Search engines only locate URLs; the actual G360 article is always
-    fetched and independently verified before it can qualify.
+    Locate G360 articles through Jina Search when GitHub cannot access
+    Gadgets 360 directly. Every URL is still fetched from Gadgets 360 and
+    independently verified before it can qualify.
     """
     found = []
     seen = set()
@@ -685,44 +882,32 @@ def gadgets360_fallback_candidates(n91_candidates, start, end):
         ]
 
         for query_text in queries:
-            query = quote_plus(query_text)
-            for search_url in (
-                f"https://www.google.com/search?q={query}&num=10",
-                f"https://www.bing.com/search?q={query}",
-            ):
-                html = get_html(search_url, timeout=20)
-                if not html:
+            results = jina_search(query_text)
+            for result in results:
+                href = normalize_url(result.get("url", ""))
+                if not href or href in seen:
                     continue
 
-                soup = BeautifulSoup(html, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    href = a.get("href", "")
-                    text = clean(a.get_text(" ", strip=True))
+                parsed = urlparse(href)
+                if "gadgets360.com" not in parsed.netloc.lower():
+                    continue
+                if not parsed.path.lower().startswith("/mobiles/news/"):
+                    continue
 
-                    if href.startswith("/url?q="):
-                        href = href.split("/url?q=", 1)[1].split("&", 1)[0]
-                    elif "uddg=" in href:
-                        href = href.split("uddg=", 1)[1].split("&", 1)[0]
+                seen.add(href)
+                found.append({
+                    "title": clean(result.get("title", "")),
+                    "url": href,
+                    "published": result.get("published"),
+                    "source": "gadgets360",
+                })
 
-                    href = normalize_url(href)
-                    if not href or href in seen:
-                        continue
+            # One successful query is enough for this model; the article
+            # verifier below will decide whether any result is real evidence.
+            if any(x.get("url") for x in found if x.get("url")):
+                pass
 
-                    parsed = urlparse(href)
-                    if "gadgets360.com" not in parsed.netloc.lower():
-                        continue
-                    if not parsed.path.lower().startswith("/mobiles/news/"):
-                        continue
-
-                    seen.add(href)
-                    found.append({
-                        "title": text,
-                        "url": href,
-                        "published": None,
-                        "source": "gadgets360",
-                    })
-
-    print("Gadgets 360 search fallback article candidates:", len(found))
+    print("Gadgets 360 Jina search article candidates:", len(found))
     return found
 
 
