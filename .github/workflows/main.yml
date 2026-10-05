@@ -43,9 +43,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 openpyxl
 
-      - name: Run RetailiX automation
-        run: |
-          python main.py
+      -- name: Run RetailiX automation
+  run: |
+    echo "===== MAIN.PY CHECK ====="
+    pwd
+    echo "Line count:"
+    wc -l main.py
+    echo "File size:"
+    wc -c main.py
+    echo "First 5 lines:"
+    head -5 main.py
+    echo "Last 5 lines:"
+    tail -5 main.py
+    echo "===== PYTHON CHECK ====="
+    python -m py_compile main.py
+    echo "===== RUNNING AUTOMATION ====="
+    python -u main.py
 
       - name: Save updated Excel file
         run: |
