@@ -358,6 +358,19 @@ SMARTPHONE_TITLE_WORDS = (
 
 GADGETS360_MOBILES_RSS = "https://www.gadgets360.com/rss/mobiles/feeds"
 GADGETS360_MOBILES_NEWS = "https://www.gadgets360.com/mobiles/news"
+
+# Official Gadgets 360 mirrors/subdomains. These are still first-party
+# Gadgets 360 sources and are useful because GitHub Actions may receive
+# HTTP 403 from the main www.gadgets360.com pages/RSS.
+GADGETS360_TURBO_LIST = "https://turbo.gadgets360.com/list"
+GADGETS360_HINDI_NEWS = "https://hindi.gadgets360.com/mobiles/news"
+GADGETS360_OFFICIAL_HOSTS = {
+    "www.gadgets360.com",
+    "gadgets360.com",
+    "turbo.gadgets360.com",
+    "hindi.gadgets360.com",
+}
+
 JINA_READER_BASE = "https://r.jina.ai/"
 JINA_SEARCH_BASE = "https://s.jina.ai/"
 NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
@@ -661,6 +674,62 @@ def get_gadgets360_news_links():
     return candidates
 
 
+def get_gadgets360_official_mirror_links():
+    """Get G360 article links from official G360 mirror/subdomains."""
+    candidates = []
+    seen = set()
+
+    # Turbo is preferred because it is English and therefore works best with
+    # the existing launch-language verifier. Hindi is a secondary official
+    # discovery source.
+    for listing_url in (GADGETS360_TURBO_LIST, GADGETS360_HINDI_NEWS):
+        html = get_html(listing_url, timeout=30)
+        if not html:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = normalize_url(a.get("href"), listing_url)
+            title = clean(a.get_text(" ", strip=True))
+            if not href or href in seen or len(title) < 20:
+                continue
+
+            parsed = urlparse(href)
+            host = parsed.netloc.lower().split(":")[0]
+            path = parsed.path.lower()
+
+            if host not in GADGETS360_OFFICIAL_HOSTS:
+                continue
+
+            is_article = (
+                (
+                    host in {"www.gadgets360.com", "gadgets360.com"}
+                    and path.startswith("/mobiles/news/")
+                )
+                or (
+                    host == "turbo.gadgets360.com"
+                    and "/mobiles/" in path
+                )
+                or (
+                    host == "hindi.gadgets360.com"
+                    and path.startswith("/mobiles/")
+                )
+            )
+
+            if not is_article:
+                continue
+
+            seen.add(href)
+            candidates.append({
+                "title": title,
+                "url": href,
+                "published": None,
+                "source": "gadgets360",
+            })
+
+    return candidates
+
+
 def direct_source_candidates(source, start, end, test_mode):
     """Discover articles from the two approved publisher sources."""
     if source == "gadgets360":
@@ -677,6 +746,13 @@ def direct_source_candidates(source, start, end, test_mode):
         if page_candidates:
             print("Gadgets 360 Mobiles News page candidates:", len(page_candidates))
             return page_candidates
+
+        # Official G360 mirror/subdomain fallback. This keeps the source
+        # first-party and avoids relying on a third-party search transport.
+        mirror_candidates = get_gadgets360_official_mirror_links()
+        if mirror_candidates:
+            print("Gadgets 360 official mirror candidates:", len(mirror_candidates))
+            return mirror_candidates
 
         # Last direct-source fallback: read the official G360 Mobiles News
         # page through Jina and extract only G360 /mobiles/news/ links.
@@ -807,8 +883,7 @@ def verify_publisher_article(candidate, brand, start, end):
         return None
 
     title_has_phone = any(x in title_low for x in SMARTPHONE_TITLE_WORDS)
-    title_has_launch = any(x in title_low for x in STRONG_LAUNCH_WORDS)
-    if not (title_has_phone and title_has_launch):
+    if not title_has_phone:
         return None
 
     brand_from_article = detect_brand(publisher_title) or detect_brand(body[:15000])
@@ -889,9 +964,24 @@ def gadgets360_fallback_candidates(n91_candidates, start, end):
                     continue
 
                 parsed = urlparse(href)
-                if "gadgets360.com" not in parsed.netloc.lower():
+                host = parsed.netloc.lower().split(":")[0]
+                path = parsed.path.lower()
+                if host not in GADGETS360_OFFICIAL_HOSTS:
                     continue
-                if not parsed.path.lower().startswith("/mobiles/news/"):
+                if not (
+                    (
+                        host in {"www.gadgets360.com", "gadgets360.com"}
+                        and path.startswith("/mobiles/news/")
+                    )
+                    or (
+                        host == "turbo.gadgets360.com"
+                        and "/mobiles/" in path
+                    )
+                    or (
+                        host == "hindi.gadgets360.com"
+                        and path.startswith("/mobiles/")
+                    )
+                ):
                     continue
 
                 seen.add(href)
@@ -1476,7 +1566,7 @@ def load_existing(ws):
 def main():
     print("=" * 78)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
-    print("DISCOVERY: 91MOBILES + GADGETS 360 DIRECT")
+    print("DISCOVERY: 91MOBILES + GADGETS 360 OFFICIAL SOURCES")
     print("DATA: OFFICIAL INDIA BRAND WEBSITE")
     print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
     print("=" * 78)
