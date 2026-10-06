@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import re
+import json
 import shutil
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
@@ -1929,10 +1930,156 @@ def extract_variants(html, model):
                     found.append(item)
 
     # JSON/script blocks can contain explicit variant objects.
+    # Xiaomi pages often keep variant state in nested JSON objects rather
+    # than visible HTML.  Inspect each JSON object independently so we only
+    # accept a colour + RAM + storage combination that is explicitly paired
+    # in the same object.  We never combine separate colour/config lists.
+    def add_explicit_mapping(mapping):
+        if not isinstance(mapping, dict):
+            return
+
+        color_value = None
+        ram_value = None
+        storage_value = None
+
+        # First pass: direct scalar fields with variant semantics.
+        for key, value in mapping.items():
+            if isinstance(value, (dict, list, tuple)):
+                continue
+            key_low = str(key).lower().replace("_", " ").replace("-", " ")
+            value_text = clean(str(value))
+            if not value_text or len(value_text) > 120:
+                continue
+
+            if color_value is None and (
+                "color" in key_low or "colour" in key_low
+            ):
+                color_value = value_text
+            elif ram_value is None and (
+                "ram" in key_low or "memory" in key_low
+            ) and re.search(r"\d{1,2}\s*GB", value_text, re.I):
+                ram_value = value_text
+            elif storage_value is None and (
+                "storage" in key_low or "rom" in key_low
+            ) and re.search(r"\d{2,4}\s*(?:GB|TB)", value_text, re.I):
+                storage_value = value_text
+
+        # Some Xiaomi objects store the full config in one field such as
+        # "4GB + 128GB" while colour is a separate scalar field.
+        if color_value and (ram_value is None or storage_value is None):
+            for key, value in mapping.items():
+                if isinstance(value, (dict, list, tuple)):
+                    continue
+                value_text = clean(str(value))
+                m = re.search(
+                    r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
+                    r"(?:\+|/|\||,|with)\s*"
+                    r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
+                    value_text,
+                    re.I,
+                )
+                if m:
+                    ram_value = ram_value or f"{m.group('ram')} GB"
+                    storage_value = storage_value or (
+                        f"{m.group('storage')} {m.group('unit').upper()}"
+                    )
+                    break
+
+        # Or the object may store the whole variant in one scalar string.
+        if not color_value:
+            for key, value in mapping.items():
+                if isinstance(value, (dict, list, tuple)):
+                    continue
+                value_text = clean(str(value))
+                m = re.search(
+                    r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
+                    r"(?:\+|/|\||,|with)\s*"
+                    r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
+                    value_text,
+                    re.I,
+                )
+                if not m:
+                    continue
+                # Look for a colour-like field in the same mapping.
+                for k2, v2 in mapping.items():
+                    if isinstance(v2, (dict, list, tuple)):
+                        continue
+                    k2_low = str(k2).lower()
+                    if "color" in k2_low or "colour" in k2_low:
+                        color_value = clean(str(v2))
+                        break
+                if color_value:
+                    ram_value = ram_value or f"{m.group('ram')} GB"
+                    storage_value = storage_value or (
+                        f"{m.group('storage')} {m.group('unit').upper()}"
+                    )
+                    break
+
+        if not (color_value and ram_value and storage_value):
+            return
+
+        # Normalize values while preserving the explicitly published colour.
+        color_value = re.sub(
+            r"\s+(?:ram|storage|memory|price|₹|\|)\b",
+            " ",
+            color_value,
+            flags=re.I,
+        ).strip(" -|,")
+        if not (2 <= len(color_value) <= 45):
+            return
+        if color_value.lower() in {
+            "select", "choose", "available", "variant", "color", "colour"
+        }:
+            return
+
+        ram_m = re.search(r"(\d{1,2})\s*GB", ram_value, re.I)
+        storage_m = re.search(
+            r"(\d{2,4})\s*(GB|TB)", storage_value, re.I
+        )
+        if not (ram_m and storage_m):
+            return
+
+        item = (
+            clean(color_value),
+            normalize_capacity(
+                f"{storage_m.group(1)} {storage_m.group(2).upper()}"
+            ),
+            normalize_capacity(f"{ram_m.group(1)} GB"),
+        )
+        if item not in found:
+            found.append(item)
+
+    def walk_json(value):
+        if isinstance(value, dict):
+            add_explicit_mapping(value)
+            for child in value.values():
+                walk_json(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk_json(child)
+
     for tag in soup.find_all("script"):
         raw = tag.string or tag.get_text()
         if not raw or len(raw) > 700000:
             continue
+
+        script_type = (tag.get("type") or "").lower()
+        if "json" in script_type or tag.get("id") in {"__NEXT_DATA__", "__NUXT_DATA__"}:
+            try:
+                parsed = json.loads(raw)
+                walk_json(parsed)
+            except Exception:
+                pass
+
+        # Also inspect JSON-looking script payloads even when the site did not
+        # declare a JSON MIME type.  This is intentionally best-effort; the
+        # scalar-object rule above prevents separate lists from being paired.
+        if raw.lstrip().startswith(("{", "[")):
+            try:
+                parsed = json.loads(raw)
+                walk_json(parsed)
+            except Exception:
+                pass
 
         for pm in ram_storage.finditer(raw):
             ram = f"{pm.group('ram')} GB"
