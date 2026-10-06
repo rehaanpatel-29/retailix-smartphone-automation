@@ -37,7 +37,7 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
-BUILD_ID = "2026-10-06-G360-GNEWS-RSS-FINAL"
+BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-DESCRIPTION-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -1627,6 +1627,18 @@ def find_official_product_page(model, brand):
             print("Official India pages (direct):", len(direct_pages))
             return direct_pages[0][0], combined
 
+        if brand in {"REDMI", "POCO"} and len(direct_pages) > 1:
+            # Xiaomi publishes the product description, specs and FAQ on
+            # separate official India URLs. Combine only those verified
+            # official pages so description/variant extraction can inspect
+            # all source material without using third-party data.
+            combined = "<html><body>" + "".join(
+                f'<section data-source="{url}">{html}</section>'
+                for url, html in direct_pages
+            ) + "</body></html>"
+            print("Official India pages (direct):", len(direct_pages))
+            return direct_pages[0][0], combined
+
         print("Official India page (direct):", direct_pages[0][0])
         return direct_pages[0][0], direct_pages[0][1]
 
@@ -1720,6 +1732,13 @@ def product_name_from_official(html, fallback):
 
 
 def official_description(html, model):
+    """Extract product description strictly from the official India page.
+
+    Some Xiaomi India product pages render the useful description inside the
+    page body / structured content rather than a normal <p> or meta tag.
+    The fallback below reads only text already present in the official page
+    and never fabricates product copy.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     for attrs in (
@@ -1752,6 +1771,63 @@ def official_description(html, model):
 
     if paragraphs:
         return " ".join(paragraphs[:4])[:2000]
+
+    # Xiaomi India can expose the main product copy as rendered body text
+    # without wrapping it in <p>/<li>. Read that official text as-is.
+    full_text = clean(soup.get_text(" ", strip=True))
+    if len(full_text) >= 60:
+        model_re = re.compile(re.escape(model), re.I)
+        matches = list(model_re.finditer(full_text))
+
+        # Prefer a product-introduction / product-description occurrence
+        # instead of a navigation/header occurrence.
+        preferred_terms = (
+            "introducing", "designed", "features", "powered by",
+            "display", "battery", "camera", "performance",
+        )
+        best = None
+        best_score = -1
+        for m in matches:
+            start = max(0, m.start() - 250)
+            end = min(len(full_text), m.end() + 1800)
+            window = full_text[start:end]
+            low_window = window.lower()
+            score = sum(2 for term in preferred_terms if term in low_window)
+            if len(window) >= 250:
+                score += 1
+            if score > best_score:
+                best_score = score
+                best = window
+
+        if best:
+            # Keep complete-looking sentences where possible and strip
+            # obvious navigation fragments. This remains source text, not
+            # generated copy.
+            sentences = re.split(r"(?<=[.!?])\s+", best)
+            useful = []
+            for sentence in sentences:
+                sentence = clean(sentence)
+                low = sentence.lower()
+                if len(sentence) < 35:
+                    continue
+                if any(x in low for x in (
+                    "sign in", "store", "support", "shop and learn",
+                    "privacy", "terms", "cookie", "javascript",
+                )):
+                    continue
+                if (
+                    model.lower() in low
+                    or any(x in low for x in (
+                        "smartphone", "phone", "battery", "camera",
+                        "display", "processor", "performance", "designed",
+                    ))
+                ):
+                    useful.append(sentence)
+
+            if useful:
+                return " ".join(useful[:6])[:2000]
+
+            return clean(best)[:2000]
 
     return ""
 
