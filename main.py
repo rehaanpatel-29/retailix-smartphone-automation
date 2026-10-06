@@ -2008,7 +2008,80 @@ def extract_variants(html, model):
             if item not in found:
                 found.append(item)
 
-    # Xiaomi catalogue pages may arrive through Jina as flattened Markdown/text\n    # where the product-card label is not preserved in img/anchor attributes.\n    # Parse the rendered official catalogue text itself. A pairing is accepted\n    # only when model + colour + RAM + storage occur in the same bounded text\n    # segment; we never combine separate lists.\n    if any("mi.com/in/product-list" in s.get("data-source", "").lower()\n           for s in soup.find_all("section")):\n        catalogue_text = clean(soup.get_text(" ", strip=True))\n        model_pattern = re.escape(model)\n        catalogue_patterns = [\n            re.compile(\n                rf"{model_pattern}\\s*(?:[-–—|:/]+\\s*)?\"\n                rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\\-]{{2,45}}?)\\s+\"\n                rf\"(?P<ram>\\d{{1,2}})\\s*GB\\s*(?:RAM\\s*)?\\+\\s*\"\n                rf\"(?P<storage>\\d{{2,4}})\\s*(?P<unit>GB|TB)\\b\",\n                re.I,\n            ),\n            re.compile(\n                rf"{model_pattern}\\s*(?:[-–—|:/]+\\s*)?\"\n                rf\"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\\-]{{2,45}}?)\\s+\"\n                rf\"(?P<ram>\\d{{1,2}})\\s*GB\\s*(?:RAM\\s*)?\"\n                rf\"(?:\\+|/|\\|)\\s*\"\n                rf\"(?P<storage>\\d{{2,4}})\\s*(?P<unit>GB|TB)\\b\",\n                re.I,\n            ),\n        ]\n        for pattern in catalogue_patterns:\n            for m in pattern.finditer(catalogue_text):\n                color = clean(m.group("color")).strip(" -|,")\n                # Stop the colour at common catalogue/navigation separators.\n                color = re.split(\n                    r\"\\s+(?:4|6|8|12)\\s*GB\\b|\\s+(?:buy|price|₹|from)\\b\",\n                    color,\n                    maxsplit=1,\n                    flags=re.I,\n                )[0].strip(\" -|,\")\n                if not (2 <= len(color) <= 45):\n                    continue\n                if color.lower() in {\"select\", \"choose\", \"available\", \"variant\", \"color\", \"colour\"}:\n                    continue\n                item = (\n                    color,\n                    normalize_capacity(f\"{m.group('storage')} {m.group('unit').upper()}\"),\n                    normalize_capacity(f\"{m.group('ram')} GB\"),\n                )\n                if item not in found:\n                    found.append(item)\n\n        # Some Jina catalogue conversions put the model in one line and the\n        # colour/configuration on the immediately following line. Treat only\n        # a small local window as one card; this still prevents cross-card\n        # combinations.\n        lines = [clean(x) for x in soup.get_text(\"\\n\", strip=True).splitlines() if clean(x)]\n        for idx, line in enumerate(lines):\n            if not re.search(model_pattern, line, re.I):\n                continue\n            window = \" \".join(lines[idx:idx + 3])\n            m = re.search(\n                r\"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\\-]{2,45}?)\\s+\"\n                r\"(?P<ram>\\d{1,2})\\s*GB\\s*(?:RAM\\s*)?\\+\\s*\"\n                r\"(?P<storage>\\d{2,4})\\s*(?P<unit>GB|TB)\\b\",\n                window,\n                re.I,\n            )\n            if not m:\n                continue\n            color = clean(m.group(\"color\")).strip(\" -|,\")\n            if not (2 <= len(color) <= 45):\n                continue\n            item = (\n                color,\n                normalize_capacity(f\"{m.group('storage')} {m.group('unit').upper()}\"),\n                normalize_capacity(f\"{m.group('ram')} GB\"),\n            )\n            if item not in found:\n                found.append(item)\n\n    # JSON/script blocks can contain explicit variant objects.
+    # Xiaomi catalogue pages may arrive through Jina as flattened Markdown/text
+    # where the product-card label is not preserved in img/anchor attributes.
+    # Parse the official catalogue text itself. A pairing is accepted only
+    # when model + colour + RAM + storage occur in the same bounded segment.
+    is_xiaomi_catalogue = (
+        "mi.com/in/product-list" in html.lower()
+        or any(
+            "mi.com/in/product-list" in s.get("data-source", "").lower()
+            for s in soup.find_all("section")
+        )
+    )
+    if is_xiaomi_catalogue:
+        catalogue_text = clean(soup.get_text(" ", strip=True))
+        model_pattern = re.escape(clean(model))
+
+        # Exact Xiaomi card form, e.g.
+        # "REDMI 17C 5G Coffee Brew 4 GB + 128 GB".
+        card_re = re.compile(
+            rf"{model_pattern}\s+"
+            rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
+            rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
+            rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
+            re.I,
+        )
+
+        for m in card_re.finditer(catalogue_text):
+            color = clean(m.group("color")).strip(" -|,:")
+            if not (2 <= len(color) <= 45):
+                continue
+            if color.lower() in {
+                "select", "choose", "available", "variant", "color", "colour",
+            }:
+                continue
+            item = (
+                color,
+                normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
+                normalize_capacity(f"{m.group('ram')} GB"),
+            )
+            if item not in found:
+                found.append(item)
+
+        # Jina may put the model and its configuration on adjacent lines.
+        # Keep the window deliberately small so separate product cards cannot
+        # accidentally be combined.
+        lines = [
+            clean(x) for x in soup.get_text("\n", strip=True).splitlines()
+            if clean(x)
+        ]
+        for idx, line in enumerate(lines):
+            if not re.search(model_pattern, line, re.I):
+                continue
+            window = " ".join(lines[idx:idx + 2])
+            m = re.search(
+                rf"{model_pattern}\s+"
+                rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
+                rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
+                rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
+                window,
+                re.I,
+            )
+            if not m:
+                continue
+            color = clean(m.group("color")).strip(" -|,:")
+            if not (2 <= len(color) <= 45):
+                continue
+            item = (
+                color,
+                normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
+                normalize_capacity(f"{m.group('ram')} GB"),
+            )
+            if item not in found:
+                found.append(item)
+
+    # JSON/script blocks can contain explicit variant objects.
     # Xiaomi pages often keep variant state in nested JSON objects rather
     # than visible HTML.  Inspect each JSON object independently so we only
     # accept a colour + RAM + storage combination that is explicitly paired
