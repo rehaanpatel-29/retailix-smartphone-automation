@@ -38,7 +38,7 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
-BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-DESCRIPTION-FINAL"
+BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-STORE-CARDS-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -1523,6 +1523,8 @@ def official_direct_product_urls(model, brand):
             f"https://www.mi.com/in/product/{slug}/",
             f"https://www.mi.com/in/product/{slug}/specs/",
             f"https://www.mi.com/in/product/{slug}/faq/",
+            "https://www.mi.com/in/product-list/",
+            "https://www.mi.com/in/product-list/redmi/",
         ])
 
     # Generic deterministic candidates for other selected brands.
@@ -1928,6 +1930,44 @@ def extract_variants(html, model):
                 )
                 if item not in found:
                     found.append(item)
+
+    # Xiaomi's official India store product-list pages can expose an
+    # explicit product-card label such as:
+    #   "REDMI 17C 5G Coffee Brew 4 GB + 128 GB"
+    # Treat that label as a valid pairing because colour + RAM + storage
+    # occur together in the same official card/alt text. This is NOT a
+    # Cartesian product and does not infer any other colour/configuration.
+    model_low = clean(model).lower()
+    paired_text_re = re.compile(
+        rf"{re.escape(model_low)}\s+(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
+        rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
+        rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
+        re.I,
+    )
+    for tag in soup.find_all(["img", "a", "span", "div", "p", "li"]):
+        values = []
+        for attr in ("alt", "title", "aria-label", "data-title", "data-name"):
+            value = tag.get(attr)
+            if value:
+                values.append(clean(value))
+        text = clean(tag.get_text(" ", strip=True))
+        if text and len(text) <= 180:
+            values.append(text)
+
+        for value in values:
+            m = paired_text_re.search(value)
+            if not m:
+                continue
+            color = clean(m.group("color")).strip(" -|,")
+            if not (2 <= len(color) <= 45):
+                continue
+            item = (
+                color,
+                normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
+                normalize_capacity(f"{m.group('ram')} GB"),
+            )
+            if item not in found:
+                found.append(item)
 
     # JSON/script blocks can contain explicit variant objects.
     # Xiaomi pages often keep variant state in nested JSON objects rather
