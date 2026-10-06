@@ -826,6 +826,10 @@ def google_news_gadgets360_candidates(model, brand):
                         "published": published,
                         "snippet": description,
                         "source": "gadgets360",
+                        "publisher_name": source_name,
+                        "publisher_url": source_url,
+                        "target_model": model,
+                        "transport": "google_news_rss",
                     })
                 continue
 
@@ -859,6 +863,10 @@ def google_news_gadgets360_candidates(model, brand):
                 "published": published,
                 "snippet": description,
                 "source": "gadgets360",
+                "publisher_name": source_name,
+                "publisher_url": source_url,
+                "target_model": model,
+                "transport": "google_news_rss",
             })
 
     return found
@@ -1043,6 +1051,95 @@ def direct_source_candidates(source, start, end, test_mode):
             candidates.append(candidate)
 
     return candidates
+
+
+def verify_gadgets360_google_news_metadata(candidate, brand, start, end):
+    """Verify a G360 launch from Google News RSS publisher metadata.
+
+    GitHub Actions can receive 403/blocked responses from the G360 site and
+    Jina can also fail to fetch the article. Google News RSS preserves the
+    publisher attribution, headline, publication date, and article snippet
+    supplied for the Gadgets 360 story. In that specific failure case we use
+    those fields as the transport-layer evidence while still requiring:
+      - publisher attribution = Gadgets 360
+      - smartphone launch wording
+      - selected brand
+      - matching target model from 91mobiles
+      - requested publication/launch date window
+
+    This is intentionally narrower than accepting a generic search result.
+    """
+    if candidate.get("transport") != "google_news_rss":
+        return None
+
+    publisher_name = clean(candidate.get("publisher_name", ""))
+    publisher_url = clean(candidate.get("publisher_url", ""))
+    if "gadgets 360" not in publisher_name.lower() and "gadgets360.com" not in publisher_url.lower():
+        return None
+
+    published = candidate.get("published")
+    if not published or not (start <= published <= end):
+        return None
+
+    title = clean(candidate.get("title", ""))
+    snippet = clean(candidate.get("snippet", ""))
+    evidence = clean(f"{title} {snippet}")
+    if len(title) < 10 or len(evidence) < 20:
+        return None
+
+    if not article_is_real_india_launch(title, evidence):
+        return None
+
+    title_low = title.lower()
+    if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
+        return None
+
+    if not any(x in title_low for x in SMARTPHONE_TITLE_WORDS):
+        return None
+
+    launch_words = (
+        "launched in india",
+        "has launched",
+        "launched for the indian market",
+        "now launched in india",
+        "now available in india",
+        "available in india",
+        "debuted in india",
+        "debuts in india",
+    )
+    if not any(x in evidence.lower() for x in launch_words):
+        return None
+
+    brand_from_article = detect_brand(title) or detect_brand(evidence[:15000])
+    if brand_from_article != brand:
+        return None
+
+    launch_date = extract_launch_date_from_text(evidence, published)
+    if not (start <= launch_date <= end):
+        return None
+
+    model = normalize_model_name(title, brand)
+    target_model = clean(candidate.get("target_model", ""))
+    if not model or not target_model:
+        return None
+
+    if model_key(model) != model_key(target_model):
+        return None
+
+    print(
+        f"  G360 RSS METADATA VERIFIED: {brand} {model} | "
+        f"date={launch_date.date()} | publisher=Gadgets 360"
+    )
+
+    return {
+        "brand": brand,
+        "name": target_model,
+        "release": launch_date,
+        "url": clean(candidate.get("url", "")),
+        "source": "gadgets360",
+        "article_date": published,
+        "verification_method": "google_news_rss_publisher_metadata",
+    }
 
 
 def verify_publisher_article(candidate, brand, start, end):
@@ -1273,9 +1370,16 @@ def discover_launches(start, end, test_mode):
             if not brand:
                 continue
 
-            verified = verify_publisher_article(
-                candidate, brand, start, end
-            )
+            verified = None
+            if candidate.get("transport") == "google_news_rss":
+                verified = verify_gadgets360_google_news_metadata(
+                    candidate, brand, start, end
+                )
+
+            if not verified:
+                verified = verify_publisher_article(
+                    candidate, brand, start, end
+                )
             if not verified:
                 continue
 
@@ -1805,7 +1909,7 @@ def main():
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
     print(f"BUILD: {BUILD_ID}")
     print("DISCOVERY: 91MOBILES + GADGETS 360 OFFICIAL SOURCES + RECOVERY")
-    print("G360 RECOVERY: Google News RSS -> official G360 URL -> Jina Reader -> verification")
+    print("G360 RECOVERY: Google News RSS publisher metadata -> G360/Jina verification")
     print("DATA: OFFICIAL INDIA BRAND WEBSITE")
     print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
     print("=" * 78)
