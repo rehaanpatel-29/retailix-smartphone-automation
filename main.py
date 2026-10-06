@@ -5,7 +5,7 @@ import shutil
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse, quote_plus, parse_qs
+from urllib.parse import urljoin, urlparse, quote_plus, parse_qs, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,6 +37,7 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
+BUILD_ID = "2026-10-06-G360-GNEWS-RSS-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -373,6 +374,7 @@ GADGETS360_MOBILES_RSS = "https://www.gadgets360.com/rss/mobiles/feeds"
 GADGETS360_MOBILES_NEWS = "https://www.gadgets360.com/mobiles/news"
 GADGETS360_TURBO_LIST = "https://turbo.gadgets360.com/list"
 GADGETS360_HINDI_NEWS = "https://hindi.gadgets360.com/mobiles/news"
+GOOGLE_NEWS_RSS_BASE = "https://news.google.com/rss/search"
 GADGETS360_OFFICIAL_HOSTS = {
     "www.gadgets360.com",
     "gadgets360.com",
@@ -742,6 +744,126 @@ def get_gadgets360_official_mirror_links():
     return [x for x in candidates if x]
 
 
+def google_news_gadgets360_candidates(model, brand):
+    """Use Google News RSS only as a locator for official Gadgets 360 stories.
+
+    The final evidence is still the Gadgets 360 article itself. Google News is
+    not treated as a second news source; it only helps the GitHub runner find
+    an official G360 URL when G360 blocks the runner.
+    """
+    queries = [
+        f'site:gadgets360.com/mobiles/news "{model}"',
+        f'site:gadgets360.com/mobiles/news "{brand}" "{model}"',
+        f'"{model}" Gadgets 360',
+    ]
+    found = []
+    seen = set()
+
+    for query_text in queries:
+        params = {
+            "q": query_text,
+            "hl": "en-IN",
+            "gl": "IN",
+            "ceid": "IN:en",
+        }
+        try:
+            response = SESSION.get(
+                GOOGLE_NEWS_RSS_BASE,
+                params=params,
+                timeout=30,
+                headers={"Accept": "application/rss+xml, application/xml, text/xml"},
+            )
+            if not response.ok or len(response.text) < 100:
+                continue
+        except requests.RequestException:
+            continue
+
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError:
+            continue
+
+        for item in root.findall(".//item"):
+            title = clean(item.findtext("title"))
+            google_link = normalize_url(clean(item.findtext("link")))
+            pub_text = clean(item.findtext("pubDate"))
+            published = parse_rss_date(pub_text)
+            source_node = item.find("source")
+            source_name = clean(source_node.text if source_node is not None else "")
+            source_url = clean(source_node.get("url", "") if source_node is not None else "")
+
+            # Only accept entries explicitly attributed to Gadgets 360.
+            if "gadgets 360" not in source_name.lower() and "gadgets360.com" not in source_url.lower():
+                continue
+
+            description_raw = item.findtext("description") or ""
+            description = clean(BeautifulSoup(description_raw, "html.parser").get_text(" ", strip=True))
+            blob = f"{title} {description}".lower()
+            if model.lower() not in blob and brand.lower() not in blob:
+                continue
+
+            # Some Google News RSS entries expose the original publisher URL
+            # inside the HTML description. Prefer it when present.
+            direct_links = []
+            for match in re.finditer(
+                r'https?://(?:www\.|turbo\.|hindi\.)?gadgets360\.com/[^\s"<>]+',
+                description_raw,
+                re.I,
+            ):
+                direct = normalize_url(match.group(0).rstrip(".,;')\""))
+                if _is_gadgets360_article_url(direct):
+                    direct_links.append(direct)
+
+            if direct_links:
+                for direct in direct_links:
+                    if direct in seen:
+                        continue
+                    seen.add(direct)
+                    found.append({
+                        "title": title,
+                        "url": direct,
+                        "google_news_url": google_link,
+                        "published": published,
+                        "snippet": description,
+                        "source": "gadgets360",
+                    })
+                continue
+
+            # Google News normally exposes a Google-hosted article link. Try
+            # to resolve it to the publisher URL, but do not require direct
+            # G360 access here; the URL can subsequently be fetched via Jina.
+            resolved = ""
+            if google_link:
+                try:
+                    rr = SESSION.get(google_link, timeout=25, allow_redirects=True)
+                    resolved = normalize_url(rr.url)
+                except requests.RequestException:
+                    resolved = ""
+
+            candidate_url = resolved if _is_gadgets360_article_url(resolved) else google_link
+            if not candidate_url or candidate_url in seen:
+                continue
+
+            # If the resolved URL is not already an official G360 article,
+            # retain the Google News URL as a transport candidate. Verification
+            # below will use Jina to follow/read it and will only accept a final
+            # official G360 article URL.
+            if not _is_gadgets360_article_url(candidate_url) and not candidate_url.startswith("https://news.google.com/"):
+                continue
+
+            seen.add(candidate_url)
+            found.append({
+                "title": title,
+                "url": candidate_url,
+                "google_news_url": google_link,
+                "published": published,
+                "snippet": description,
+                "source": "gadgets360",
+            })
+
+    return found
+
+
 def search_engine_gadgets360_candidates(model, brand):
     """Use public search engines only to locate official G360 article URLs.
 
@@ -948,6 +1070,13 @@ def verify_publisher_article(candidate, brand, start, end):
         if jina:
             body = clean(jina.get("content", ""))
             publisher_title = clean(jina.get("title", "")) or title
+            final_url = normalize_url(jina.get("url", ""))
+            # A Google News transport URL is only useful if Jina resolves it
+            # to the actual official G360 article.
+            if url.startswith("https://news.google.com/") and not _is_gadgets360_article_url(final_url):
+                return None
+            if final_url:
+                url = final_url
             published = (
                 parse_date(jina.get("published", ""))
                 or candidate.get("published")
@@ -1054,7 +1183,22 @@ def gadgets360_fallback_candidates(n91_candidates, start, end):
     found = []
     seen = set()
 
-    # 1) Public search engines are the primary recovery route when GitHub
+    # 1) Google News RSS is a lightweight, runner-friendly locator. It is
+    # never accepted as the publisher source; only the final G360 article is.
+    for item in n91_candidates:
+        model = item.get("name", "").strip()
+        brand = item.get("brand", "").strip()
+        if not model or not brand:
+            continue
+        for candidate in google_news_gadgets360_candidates(model, brand):
+            if candidate["url"] in seen:
+                continue
+            seen.add(candidate["url"])
+            found.append(candidate)
+
+    print("Gadgets 360 Google News RSS candidates:", len(found))
+
+    # 2) Public search engines are the next recovery route when GitHub
     # cannot fetch G360 directly.
     for candidate in gadgets360_search_fallback_candidates(n91_candidates):
         if candidate["url"] in seen:
@@ -1659,7 +1803,9 @@ def load_existing(ws):
 def main():
     print("=" * 78)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
-    print("DISCOVERY: 91MOBILES + GADGETS 360 DIRECT")
+    print(f"BUILD: {BUILD_ID}")
+    print("DISCOVERY: 91MOBILES + GADGETS 360 OFFICIAL SOURCES + RECOVERY")
+    print("G360 RECOVERY: Google News RSS -> official G360 URL -> Jina Reader -> verification")
     print("DATA: OFFICIAL INDIA BRAND WEBSITE")
     print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
     print("=" * 78)
