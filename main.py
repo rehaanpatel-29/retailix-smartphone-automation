@@ -38,7 +38,7 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
-BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-STORE-CARDS-GATE-FIX-FINAL"
+BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-INDEXED-CATALOGUE-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -2080,6 +2080,62 @@ def extract_variants(html, model):
             )
             if item not in found:
                 found.append(item)
+
+    # Xiaomi India catalogue pages are client-rendered and may return only a
+    # JavaScript shell to GitHub Actions. In that case, use a Google index lookup
+    # ONLY as a locator for an official mi.com India catalogue result. The
+    # accepted variant still must be present in the indexed snippet together with
+    # the exact model + colour + RAM + storage, and the result URL must be mi.com.
+    # This is not a Cartesian product and does not use third-party product data.
+    if is_xiaomi_catalogue and not found:
+        try:
+            search_q = quote_plus(
+                f'site:mi.com/in/product-list "{model}" "GB +"'
+            )
+            search_url = f"https://www.google.com/search?q={search_q}&num=10"
+            search_html = get_html(search_url, timeout=20)
+            if search_html:
+                ssoup = BeautifulSoup(search_html, "html.parser")
+                for a in ssoup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if "mi.com/in/product-list" not in href.lower():
+                        continue
+                    parent = a
+                    for _ in range(4):
+                        parent = parent.parent if parent.parent else parent
+                    snippet = clean(parent.get_text(" ", strip=True))
+                    if not snippet or len(snippet) > 1200:
+                        continue
+
+                    # Require the exact official catalogue-card shape in the
+                    # indexed text. Do not accept separate lists of colours and
+                    # configurations.
+                    m = re.search(
+                        rf"{re.escape(clean(model))}\s+"
+                        rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
+                        rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
+                        rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
+                        snippet,
+                        re.I,
+                    )
+                    if not m:
+                        continue
+                    color = clean(m.group("color")).strip(" -|,:")
+                    if not (2 <= len(color) <= 45):
+                        continue
+                    item = (
+                        color,
+                        normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
+                        normalize_capacity(f"{m.group('ram')} GB"),
+                    )
+                    if item not in found:
+                        found.append(item)
+                        print(
+                            "Xiaomi official catalogue index verified:",
+                            color, "|", item[1], "|", item[2]
+                        )
+        except Exception as exc:
+            print("Xiaomi catalogue index fallback unavailable:", type(exc).__name__)
 
     # JSON/script blocks can contain explicit variant objects.
     # Xiaomi pages often keep variant state in nested JSON objects rather
