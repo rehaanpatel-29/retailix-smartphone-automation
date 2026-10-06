@@ -1502,10 +1502,135 @@ def extract_search_result_links(html, allowed_domains):
     return out
 
 
+def official_direct_product_urls(model, brand):
+    """Return deterministic official India product URLs before search-engine discovery."""
+    key = model_key(model)
+    urls = []
+
+    # Known official India pages for currently tested launches.
+    if brand == "SAMSUNG" and "galaxy a08" in key:
+        urls.extend([
+            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-dark-blue-64gb-sm-a085fdbdins/",
+            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-green-64gb-sm-a085fzgdins/",
+            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-silver-64gb-sm-a085fzsdins/",
+            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-dark-blue-64gb-sm-a085fdbdins/buy/",
+        ])
+
+    if brand in {"REDMI", "POCO"}:
+        slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+        urls.extend([
+            f"https://www.mi.com/in/product/{slug}/",
+            f"https://www.mi.com/in/product/{slug}/specs/",
+            f"https://www.mi.com/in/product/{slug}/faq/",
+        ])
+
+    # Generic deterministic candidates for other selected brands.
+    slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+    if brand == "MOTOROLA":
+        urls.extend([
+            f"https://www.motorola.in/smartphones/{slug}/",
+            f"https://www.motorola.in/smartphones/{slug}/buy/",
+        ])
+    elif brand == "ONEPLUS":
+        urls.extend([
+            f"https://www.oneplus.in/{slug}",
+            f"https://www.oneplus.in/{slug}/buy",
+        ])
+    elif brand == "REALME":
+        urls.extend([
+            f"https://www.realme.com/in/{slug}",
+            f"https://www.realme.com/in/{slug}/specs",
+        ])
+    elif brand == "VIVO":
+        urls.extend([
+            f"https://www.vivo.com/in/products/{slug}",
+        ])
+    elif brand == "OPPO":
+        urls.extend([
+            f"https://www.oppo.com/in/smartphones/series/{slug}/",
+            f"https://www.oppo.com/in/smartphones/{slug}/",
+        ])
+    elif brand == "INFINIX":
+        urls.extend([
+            f"https://infinixmobiles.in/products/{slug}",
+            f"https://www.infinixmobility.com/smartphones/{slug}",
+        ])
+
+    # Deduplicate while preserving order.
+    out = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def fetch_official_page(url, timeout=30):
+    """Fetch an official page directly; use Jina only as a transport fallback."""
+    html = get_html(url, timeout=timeout)
+    if html:
+        return html
+
+    jina = jina_read_url(url, timeout=45)
+    if jina and jina.get("content"):
+        # Preserve the official source URL while making the reader output
+        # parseable by the existing BeautifulSoup-based extractors.
+        title = clean(jina.get("title", ""))
+        content = jina.get("content", "")
+        return (
+            "<html><head><title>"
+            + title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            + "</title></head><body>"
+            + content
+            + "</body></html>"
+        )
+    return ""
+
+
 def find_official_product_page(model, brand):
+    """Find an official India product page without depending on Google/Bing."""
     domains = BRANDS[brand]
     candidates = []
 
+    # 1) Deterministic official URLs first. This is the important path for
+    # GitHub Actions, where search engines and some brand search pages can fail.
+    direct_pages = []
+    for url in official_direct_product_urls(model, brand):
+        html = fetch_official_page(url, timeout=30)
+        if not html:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        body = clean(soup.get_text(" ", strip=True))
+        low = body.lower()
+        model_words = [
+            w.lower() for w in re.findall(r"[A-Za-z0-9]+", model) if len(w) >= 3
+        ]
+
+        if model_words and not all(w in low for w in model_words[:2]):
+            continue
+        if not official_page_is_india(url) and "india" not in low:
+            continue
+
+        direct_pages.append((url, html))
+
+    if direct_pages:
+        # Samsung publishes one India product URL per colour/SKU. Combine the
+        # verified official pages so the variant extractor can retain every
+        # explicitly published colour/SKU without inventing combinations.
+        if brand == "SAMSUNG" and len(direct_pages) > 1:
+            combined = "<html><body>" + "".join(
+                f'<section data-source="{url}">{html}</section>'
+                for url, html in direct_pages
+            ) + "</body></html>"
+            print("Official India pages (direct):", len(direct_pages))
+            return direct_pages[0][0], combined
+
+        print("Official India page (direct):", direct_pages[0][0])
+        return direct_pages[0][0], direct_pages[0][1]
+
+    # 2) Existing search-engine discovery as a secondary method.
     for search_url in official_search_urls(model, domains):
         html = get_html(search_url, timeout=20)
         if not html:
@@ -1524,7 +1649,6 @@ def find_official_product_page(model, brand):
                 if len(word) >= 3 and word in blob:
                     score += 1
 
-            # Avoid support, manuals, careers, and generic landing pages.
             if any(x in href.lower() for x in (
                 "/support", "/help", "/careers", "/about",
                 "/privacy", "/terms", "/store-locator",
@@ -1541,28 +1665,23 @@ def find_official_product_page(model, brand):
     for score, url in candidates:
         if score < 5:
             continue
-        html = get_html(url, timeout=30)
+        html = fetch_official_page(url, timeout=30)
         if not html:
             continue
 
         soup = BeautifulSoup(html, "html.parser")
         body = clean(soup.get_text(" ", strip=True))
         low = body.lower()
-
         model_words = [
-            w.lower()
-            for w in re.findall(r"[A-Za-z0-9]+", model)
-            if len(w) >= 3
+            w.lower() for w in re.findall(r"[A-Za-z0-9]+", model) if len(w) >= 3
         ]
 
         if model_words and not all(w in low for w in model_words[:2]):
             continue
-
-        # India confirmation. URL can be global-looking, but page must
-        # contain India when the URL itself doesn't establish India.
         if not official_page_is_india(url) and "india" not in low:
             continue
 
+        print("Official India page (search):", url)
         return url, html
 
     return "", ""
@@ -1653,6 +1772,26 @@ def extract_variants(html, model):
     """
     soup = BeautifulSoup(html, "html.parser")
     found = []
+
+    # Samsung India uses SKU-specific pages whose title explicitly contains
+    # RAM/storage and colour, e.g. "4GB/64GB - (Dark Blue)". Read that exact
+    # published combination instead of constructing a Cartesian product.
+    samsung_title_re = re.compile(
+        r"(?P<ram>\d{1,2})\s*GB\s*/\s*"
+        r"(?P<storage>\d{2,4})\s*GB.*?\((?P<color>[^)]+)\)",
+        re.I,
+    )
+    for tag in soup.find_all("title"):
+        title_text = clean(tag.get_text(" ", strip=True))
+        m = samsung_title_re.search(title_text)
+        if m:
+            item = (
+                clean(m.group("color")),
+                normalize_capacity(f"{m.group('storage')} GB"),
+                normalize_capacity(f"{m.group('ram')} GB"),
+            )
+            if item not in found:
+                found.append(item)
 
     ram_storage = re.compile(
         r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
