@@ -38,7 +38,7 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
-BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-STORE-CARDS-FINAL"
+BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-STORE-CARDS-JS-FALLBACK-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -1523,6 +1523,7 @@ def official_direct_product_urls(model, brand):
             f"https://www.mi.com/in/product/{slug}/",
             f"https://www.mi.com/in/product/{slug}/specs/",
             f"https://www.mi.com/in/product/{slug}/faq/",
+            f"https://www.mi.com/in/product/{slug}/buy/",
             "https://www.mi.com/in/product-list/",
             "https://www.mi.com/in/product-list/redmi/",
         ])
@@ -1570,15 +1571,33 @@ def official_direct_product_urls(model, brand):
 
 
 def fetch_official_page(url, timeout=30):
-    """Fetch an official page directly; use Jina only as a transport fallback."""
+    """Fetch an official page directly; force Jina for Xiaomi JS shells."""
     html = get_html(url, timeout=timeout)
+
+    low_url = url.lower()
+    low_html = (html or "").lower()
+    text_len = 0
     if html:
+        text_len = len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
+
+    # Xiaomi product-list pages can return a 200 OK JavaScript shell to
+    # GitHub Actions. That shell has no product cards, so do not accept it
+    # as the final source. Force the readable fallback instead.
+    xiaomi_store_shell = (
+        "mi.com/in/product-list" in low_url
+        and (
+            "javascript is not available" in low_html
+            or "enable javascript" in low_html
+            or "shop in xiaomi xiaomi india official store" in low_html
+        )
+        and text_len < 12000
+    )
+
+    if html and not xiaomi_store_shell:
         return html
 
     jina = jina_read_url(url, timeout=45)
     if jina and jina.get("content"):
-        # Preserve the official source URL while making the reader output
-        # parseable by the existing BeautifulSoup-based extractors.
         title = clean(jina.get("title", ""))
         content = jina.get("content", "")
         return (
@@ -1588,7 +1607,8 @@ def fetch_official_page(url, timeout=30):
             + content
             + "</body></html>"
         )
-    return ""
+
+    return html or ""
 
 
 def find_official_product_page(model, brand):
