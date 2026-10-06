@@ -38,7 +38,7 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
-BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-STORE-CARDS-JS-FALLBACK-FINAL"
+BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-STORE-CARDS-GATE-FIX-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -1631,7 +1631,20 @@ def find_official_product_page(model, brand):
             w.lower() for w in re.findall(r"[A-Za-z0-9]+", model) if len(w) >= 3
         ]
 
-        if model_words and not all(w in low for w in model_words[:2]):
+        # Xiaomi product-list pages are catalogue pages, not single-product
+        # pages. Their readable/Jina representation can omit the exact model
+        # from the page-level title/body even though the individual product
+        # card (alt/title/aria-label/text) contains the model and variant.
+        # Do not reject those catalogue pages at this gate; extract_variants()
+        # performs the exact model + explicit colour/RAM/storage matching.
+        is_xiaomi_catalogue = (
+            brand in {"REDMI", "POCO"}
+            and "mi.com/in/product-list" in url.lower()
+        )
+
+        if (not is_xiaomi_catalogue) and model_words and not all(
+            w in low for w in model_words[:2]
+        ):
             continue
         if not official_page_is_india(url) and "india" not in low:
             continue
@@ -1660,6 +1673,12 @@ def find_official_product_page(model, brand):
                 for url, html in direct_pages
             ) + "</body></html>"
             print("Official India pages (direct):", len(direct_pages))
+            catalogue_count = sum(
+                1 for page_url, _ in direct_pages
+                if "mi.com/in/product-list" in page_url.lower()
+            )
+            if catalogue_count:
+                print("Xiaomi official catalogue pages included:", catalogue_count)
             return direct_pages[0][0], combined
 
         print("Official India page (direct):", direct_pages[0][0])
