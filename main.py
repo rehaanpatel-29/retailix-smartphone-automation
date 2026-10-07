@@ -2,8 +2,6 @@ from pathlib import Path
 import os
 import re
 import shutil
-import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, quote_plus
 
@@ -16,8 +14,8 @@ from openpyxl import load_workbook
 # RETAILIX SMARTPHONE AUTOMATION
 #
 # DISCOVERY:
-#   91mobiles + Gadgets 360 are queried directly.
-#   The actual publisher articles are then independently verified.
+#   91mobiles is queried directly.
+#   The actual 91mobiles articles are then independently verified.
 #
 # PRODUCT DATA:
 #   Official India brand website - RAM / storage / colour /
@@ -108,28 +106,13 @@ def same_domain(url, domains):
 
 
 def get_html(url, timeout=30):
-    """Fetch a page; for Gadgets 360, retry its own AMP representation.
-
-    The AMP retry is still the same Gadgets 360 publisher content. It is
-    only a transport/accessibility fallback for runners that receive 403s
-    from the normal page. No external search or news source is consulted.
-    """
-    urls = [url]
-    parsed = urlparse(url)
-    if "gadgets360.com" in parsed.netloc.lower():
-        path = parsed.path
-        if path and not path.endswith("/amp") and path.startswith("/mobiles/news/"):
-            urls.append(url.rstrip("/") + "/amp")
-        elif path == "/mobiles/news":
-            urls.append(GADGETS360_MOBILES_AMP if "GADGETS360_MOBILES_AMP" in globals() else "https://www.gadgets360.com/mobiles/amp")
-
-    for target in urls:
-        try:
-            r = SESSION.get(target, timeout=timeout, allow_redirects=True)
-            if r.ok and len(r.text) > 300:
-                return r.text
-        except requests.RequestException:
-            continue
+    """Fetch a page directly from the requested source."""
+    try:
+        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+        if r.ok and len(r.text) > 300:
+            return r.text
+    except requests.RequestException:
+        pass
     return ""
 
 
@@ -323,11 +306,10 @@ def model_key(name):
 
 
 # ------------------------------------------------------------
-# DIRECT 91MOBILES + GADGETS 360 DISCOVERY + TWO-SOURCE LAUNCH VERIFICATION
+# DIRECT 91MOBILES DISCOVERY + LAUNCH VERIFICATION
 #
 # 91mobiles is discovered from its own Mobiles category pages.
-# Gadgets 360 is discovered from its own Mobiles RSS feed.
-# The actual publisher articles are then independently verified.
+# The actual 91mobiles articles are then independently verified.
 # ------------------------------------------------------------
 
 STRONG_LAUNCH_WORDS = (
@@ -372,9 +354,6 @@ SMARTPHONE_TITLE_WORDS = (
     "infinix", "narzo",
 )
 
-GADGETS360_MOBILES_RSS = "https://www.gadgets360.com/rss/mobiles/feeds"
-GADGETS360_MOBILES_NEWS = "https://www.gadgets360.com/mobiles/news"
-GADGETS360_MOBILES_AMP = "https://www.gadgets360.com/mobiles/amp"
 NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
 NINETYONE_MAX_PAGES = 5
 # Historical test mode needs a deeper archive scan because a test date can
@@ -442,38 +421,6 @@ def parse_publisher_listing_date(text):
     return parse_date(text)
 
 
-def parse_gadgets360_rss(xml):
-    """Parse the official Gadgets 360 Mobiles RSS feed."""
-    try:
-        root = ET.fromstring(xml)
-    except ET.ParseError:
-        return []
-
-    candidates = []
-    for item in root.findall(".//item"):
-        title = clean(item.findtext("title"))
-        link = normalize_url(clean(item.findtext("link")))
-        pub_text = clean(item.findtext("pubDate"))
-        published = parse_rss_date(pub_text)
-
-        if not title or not link or not published:
-            continue
-
-        if "gadgets360.com" not in urlparse(link).netloc.lower():
-            continue
-        if not urlparse(link).path.lower().startswith("/mobiles/news/"):
-            continue
-
-        candidates.append({
-            "title": title,
-            "url": link,
-            "published": published,
-            "source": "gadgets360",
-        })
-
-    return candidates
-
-
 def parse_91mobiles_category(html):
     """Parse direct 91mobiles Mobiles category pages for article links."""
     soup = BeautifulSoup(html, "html.parser")
@@ -524,113 +471,34 @@ def parse_91mobiles_category(html):
     return candidates
 
 
-def get_gadgets360_news_links():
-    """Get article links from the official G360 Mobiles News page."""
-    html = get_html(GADGETS360_MOBILES_NEWS, timeout=30)
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    candidates = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = normalize_url(a.get("href"), GADGETS360_MOBILES_NEWS)
-        title = clean(a.get_text(" ", strip=True))
-        if not href or href in seen:
-            continue
-
-        parsed = urlparse(href)
-        if "gadgets360.com" not in parsed.netloc.lower():
-            continue
-        if not parsed.path.lower().startswith("/mobiles/news/"):
-            continue
-        if len(title) < 20:
-            continue
-
-        seen.add(href)
-        candidates.append({
-            "title": title,
-            "url": href,
-            "published": None,
-            "source": "gadgets360",
-        })
-
-    return candidates
-
-
-
 def direct_source_candidates(source, start, end, test_mode):
-    """Discover articles from the two approved publisher sources."""
-    if source == "gadgets360":
-        # Gadgets 360 is a required confirmation source.
-        # Try only Gadgets 360's own RSS and Mobiles News page.
-        # If neither provides usable data, return no candidates and let the
-        # cross-check logic skip the 91mobiles candidate.
-        xml = get_html(GADGETS360_MOBILES_RSS, timeout=30)
-        if xml:
-            rss_candidates = parse_gadgets360_rss(xml)
-            if rss_candidates:
-                print("Gadgets 360 RSS candidates:", len(rss_candidates))
-                return rss_candidates
-
-        print("Gadgets 360 RSS unavailable.")
-
-        page_candidates = get_gadgets360_news_links()
-        if page_candidates:
-            print("Gadgets 360 Mobiles News page candidates:", len(page_candidates))
-            return page_candidates
-
-        # Some GitHub runners are blocked on the normal G360 news page, while
-        # the publisher's AMP mobile index remains reachable. This is still
-        # Gadgets 360 data; it is not a third-party discovery source.
-        amp_html = get_html(GADGETS360_MOBILES_AMP, timeout=30)
-        if amp_html:
-            soup = BeautifulSoup(amp_html, "html.parser")
-            amp_candidates, seen = [], set()
-            for a in soup.find_all("a", href=True):
-                href = normalize_url(a.get("href"), GADGETS360_MOBILES_AMP)
-                title = clean(a.get_text(" ", strip=True))
-                parsed = urlparse(href)
-                if not href or href in seen:
-                    continue
-                if "gadgets360.com" not in parsed.netloc.lower():
-                    continue
-                if not parsed.path.lower().startswith("/mobiles/news/"):
-                    continue
-                if len(title) < 20:
-                    continue
-                seen.add(href)
-                amp_candidates.append({
-                    "title": title,
-                    "url": href,
-                    "published": None,
-                    "source": "gadgets360",
-                })
-            if amp_candidates:
-                print("Gadgets 360 AMP candidates:", len(amp_candidates))
-                return amp_candidates
-
-        print("Gadgets 360 did not provide usable discovery data; skipping G360 confirmation.")
+    """Discover articles from 91mobiles only."""
+    if source != "91mobiles":
         return []
 
     candidates = []
     seen = set()
 
-    # Normal production mode only needs the current Mobiles category pages.
     # Historical test mode scans the 91mobiles archive because the requested
-    # date may be weeks behind the current publisher homepage.
+    # date may be behind the current publisher homepage.
     if test_mode:
         max_pages = NINETYONE_TEST_MAX_PAGES
         archive_start = start - timedelta(days=1)
         for page in range(1, max_pages + 1):
-            url = NINETYONE_SEARCH_ARCHIVE if page == 1 else f"{NINETYONE_SEARCH_ARCHIVE}page/{page}/"
+            url = (
+                NINETYONE_SEARCH_ARCHIVE
+                if page == 1
+                else f"{NINETYONE_SEARCH_ARCHIVE}page/{page}/"
+            )
             html = get_html(url, timeout=30)
             if not html:
                 continue
 
             page_candidates = parse_91mobiles_category(html)
-            page_dates = [c["published"] for c in page_candidates if c.get("published")]
+            page_dates = [
+                c["published"] for c in page_candidates
+                if c.get("published")
+            ]
 
             for candidate in page_candidates:
                 if candidate["url"] in seen:
@@ -645,7 +513,11 @@ def direct_source_candidates(source, start, end, test_mode):
         return candidates
 
     for page in range(NINETYONE_MAX_PAGES):
-        url = NINETYONE_MOBILES_CATEGORY if page == 0 else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
+        url = (
+            NINETYONE_MOBILES_CATEGORY
+            if page == 0
+            else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
+        )
         html = get_html(url, timeout=30)
         if not html:
             continue
@@ -658,7 +530,6 @@ def direct_source_candidates(source, start, end, test_mode):
 
     return candidates
 
-
 def verify_publisher_article(candidate, brand, start, end):
     url = candidate.get("url", "")
     if not url:
@@ -669,10 +540,8 @@ def verify_publisher_article(candidate, brand, start, end):
     body = ""
     published = None
 
-    # Always verify the actual publisher article directly.
-    # If Gadgets 360 blocks the GitHub runner or does not return usable HTML,
-    # verification fails and the candidate is skipped. No third-party
-    # transport or search source is used.
+    # Always verify the actual 91mobiles article directly.
+    # No second news source is required.
     html = get_html(url, timeout=30)
     if not html:
         return None
@@ -753,58 +622,24 @@ def discover_launches(start, end, test_mode):
     """
     Discovery and verification rule:
 
-      1. 91mobiles and Gadgets 360 are queried directly.
-      2. The actual publisher articles are independently verified directly.
-      3. Both publishers must report the same selected-brand phone as
-         launched in India.
-      4. Their India launch dates must agree.
-      5. If Gadgets 360 is unavailable or does not provide the required data,
-         the phone is skipped.
-      6. Only phones inside the requested window qualify.
+      1. 91mobiles is the sole launch discovery source.
+      2. The actual 91mobiles article is independently verified directly.
+      3. The article must report an actual India launch, not a rumour,
+         upcoming launch, review, sale-only update, or global-only launch.
+      4. Only phones inside the requested window qualify.
     """
-    n91 = discover_source_candidates("91mobiles", start, end, test_mode)
-    g360 = discover_source_candidates("gadgets360", start, end, test_mode)
+    launches = discover_source_candidates("91mobiles", start, end, test_mode)
 
-    print("91mobiles verified launch candidates:", len(n91))
-    print("Gadgets 360 verified launch candidates:", len(g360))
+    print("91mobiles verified launch candidates:", len(launches))
 
-    g360_map = {
-        (item["brand"], model_key(item["name"])): item
-        for item in g360
-    }
-
-    qualified = []
-
-    for item in n91:
-        key = (item["brand"], model_key(item["name"]))
-        other = g360_map.get(key)
-
-        if not other:
-            print(
-                f"  CROSS-CHECK WAIT: {item['brand']} {item['name']} "
-                f"({item['release'].date()}) not confirmed by Gadgets 360."
-            )
-            continue
-
-        if date_only(other["release"]) != date_only(item["release"]):
-            print(
-                f"  DATE MISMATCH: {item['name']} | "
-                f"91mobiles={item['release'].date()} | "
-                f"Gadgets360={other['release'].date()}"
-            )
-            continue
-
-        item["g360_url"] = other["url"]
-        item["g360_release"] = other["release"]
+    for item in launches:
         item["discovery_date"] = item["release"]
-        qualified.append(item)
-
         print(
             f"  QUALIFIED: {item['brand']} {item['name']} | "
             f"India launch date: {item['release'].date()}"
         )
 
-    return qualified
+    return launches
 
 
 # OFFICIAL INDIA BRAND SEARCH
@@ -1282,7 +1117,7 @@ def load_existing(ws):
 def main():
     print("=" * 78)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
-    print("DISCOVERY: 91MOBILES + GADGETS 360 DIRECT")
+    print("DISCOVERY: 91MOBILES ONLY")
     print("DATA: OFFICIAL INDIA BRAND WEBSITE")
     print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
     print("=" * 78)
@@ -1329,12 +1164,12 @@ def main():
     if not launches:
         if test_mode:
             print(
-                f"\nNo selected-brand phone was independently confirmed "
-                f"by BOTH 91mobiles and Gadgets 360 on {start.date()}."
+                f"\nNo selected-brand phone was verified by 91mobiles "
+                f"on {start.date()}."
             )
         else:
-            print("\nNo selected-brand phone was independently confirmed")
-            print("by BOTH 91mobiles and Gadgets 360 in the last 24 hours.")
+            print("\nNo selected-brand phone was verified by 91mobiles")
+            print("in the last 24 hours.")
         print("AUTOMATION COMPLETED - NO EXCEL CHANGES.")
         return
 
@@ -1353,7 +1188,6 @@ def main():
         print(f"PROCESSING: {brand} | {model}")
         print(f"India release date: {item['discovery_date'].date()}")
         print(f"91mobiles: {item['url']}")
-        print(f"Gadgets 360: {item.get('g360_url', '')}")
 
         official_url, official_html = find_official_product_page(
             model, brand
