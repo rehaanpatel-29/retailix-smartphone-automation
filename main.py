@@ -45,9 +45,9 @@ BRANDS = {
     "OPPO": ["oppo.com"],
     "POCO": ["mi.com"],
     "REDMI": ["mi.com"],
-    "REALME": ["realme.com"],
+    "REALME": ["realme.com", "buy.realme.com"],
     "SAMSUNG": ["samsung.com"],
-    "VIVO": ["vivo.com"],
+    "VIVO": ["vivo.com", "shop.vivo.com"],
 }
 
 BRAND_ALIASES = {
@@ -747,12 +747,43 @@ def _official_url_matches_model(url, model):
 
 def _official_page_matches_model(html, model):
     soup = BeautifulSoup(html, "html.parser")
-    body = re.sub(r"[^a-z0-9]+", " ", clean(soup.get_text(" ", strip=True)).lower())
+
+    # Check visible text plus title/meta tags. Official e-store pages often
+    # render the product name as compact text such as "X Fold6" while the
+    # discovery title may be "Vivo X Fold 6".
+    parts = [clean(soup.get_text(" ", strip=True))]
+    for attrs in (
+        {"property": "og:title"},
+        {"name": "twitter:title"},
+        {"name": "description"},
+        {"property": "og:description"},
+    ):
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            parts.append(clean(tag.get("content")))
+
+    body = " ".join(parts).lower()
+    compact_body = re.sub(r"[^a-z0-9]+", "", body)
     words = _official_model_words(model)
     if not words:
         return False
-    # Require all meaningful model tokens in the official page itself.
+
+    compact_model = re.sub(r"[^a-z0-9]+", "", model.lower())
+    if compact_model and compact_model in compact_body:
+        return True
+
     return all(re.search(r"\b" + re.escape(w) + r"\b", body) for w in words)
+
+
+# Exact official e-store URLs for products already independently confirmed
+# by the 91mobiles launch verifier. These are locators only; all product
+# data is still extracted from the fetched official page.
+OFFICIAL_PRODUCT_OVERRIDES = {
+    ("VIVO", "vivo x fold 6"): "https://shop.vivo.com/in/product/10372",
+    ("VIVO", "vivo s2 fe"): "https://shop.vivo.com/in/product/10374",
+    ("VIVO", "vivo v80"): "https://shop.vivo.com/in/product/10373",
+    ("REALME", "realme p4s lite"): "https://buy.realme.com/in/goods/824",
+}
 
 
 def _sitemap_locations(domain):
@@ -848,6 +879,19 @@ def find_official_product_page(model, brand):
     domains = BRANDS[brand]
     candidates = []
 
+    # 0) Prefer an exact official e-store locator when this model has been
+    # independently confirmed by 91mobiles. This prevents an unrelated
+    # product/career page from winning a loose search.
+    override_key = (brand, clean(model).lower())
+    override_url = OFFICIAL_PRODUCT_OVERRIDES.get(override_key)
+    if override_url:
+        # These URLs are exact official e-store pages for phones already
+        # independently verified by 91mobiles. Fetch them directly and stop:
+        # do not waste time crawling unrelated sitemaps/search results.
+        html = get_html(override_url, timeout=20)
+        if html and official_page_is_india(override_url):
+            return override_url, html
+
     # 1) Try common official India product URL patterns first. This avoids
     # search-engine dependence and is very fast for brands such as vivo/realme.
     slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
@@ -942,12 +986,17 @@ def find_official_product_page(model, brand):
     for url, score in sorted(ranked.items(), key=lambda x: (-x[1], x[0])):
         if score < 5:
             continue
-        html = get_html(url, timeout=8)
+        html = get_html(url, timeout=12)
         if not html:
             continue
 
-        if not _official_page_matches_model(html, model):
-            continue
+        # Exact official e-store overrides are already tied to a specific
+        # 91mobiles-verified model. Some store pages are heavily JS-rendered
+        # and their initial HTML does not expose the model name, so do not
+        # reject an exact override merely because the visible HTML is sparse.
+        if not (brand, clean(model).lower()) in OFFICIAL_PRODUCT_OVERRIDES:
+            if not _official_page_matches_model(html, model):
+                continue
 
         # Reject obvious non-product pages even when the model name appears
         # somewhere in navigation or site-wide text.
@@ -1162,6 +1211,61 @@ def extract_variants(html, model):
                                 if piece.lower() not in {x.lower() for x in colors}:
                                     colors.append(piece)
                         break
+
+    # 4) JSON/embedded-store fallback. E-commerce pages frequently keep the
+    # selector data in script/JSON rather than visible text. Read only explicit
+    # capacity pairs and explicit colour-name fields from the official page.
+    script_blob = "\n".join(
+        (tag.string or tag.get_text(" ", strip=True))
+        for tag in soup.find_all("script")
+        if (tag.string or tag.get_text(" ", strip=True))
+    )
+    combined = text + "\n" + script_blob
+
+    if not capacities:
+        for m in pair_re_no_ram.finditer(combined):
+            pair = (normalize_capacity(f"{m.group('storage')} {m.group('unit')}"),
+                    normalize_capacity(f"{m.group('ram')} GB"))
+            if pair not in capacities:
+                capacities.append(pair)
+        for m in pair_re.finditer(combined):
+            pair = norm_pair(m)
+            if pair not in capacities:
+                capacities.append(pair)
+
+    # JSON fields such as color/colorName/colourName are high-confidence
+    # selector values.
+    for m in re.finditer(
+        r"(?:color|colour)(?:Name)?\s*[\"']?\s*[:=]\s*[\"']([^\"']{2,60})",
+        script_blob, re.I,
+    ):
+        value = clean(m.group(1))
+        if value and not re.search(r"\b(?:select|choose|color|colour)\b", value, re.I):
+            if value.lower() not in {x.lower() for x in colors}:
+                colors.append(value)
+
+    # A compact visible selector may contain several colour names between the
+    # Colour label and the next selector heading. Capture the bounded segment
+    # and split it using known-capitalized colour candidates.
+    if not colors:
+        m = re.search(
+            r"(?:^|\n)colou?r\s*(?:[:|-]\s*)?(.{0,180}?)(?=\n(?:quantity|storage|specification|ram|overview)\b|$)",
+            text_raw, re.I | re.S,
+        )
+        if m:
+            segment = clean(m.group(1))
+            segment = re.sub(r"\b(?:select|choose|confirm|add to cart|buy now)\b", "", segment, flags=re.I)
+            # Prefer multi-word title-case runs, then individual title-case
+            # words; avoid UI fragments and currency/numeric values.
+            candidates2 = re.findall(
+                r"\b[A-Z][A-Za-z0-9&'’./-]*(?:\s+[A-Z][A-Za-z0-9&'’./-]*){0,3}\b",
+                segment,
+            )
+            for value in candidates2:
+                value = clean(value)
+                if 2 <= len(value) <= 45 and not re.search(r"\d|\b(?:Color|Colour|Quantity|Storage|Specification)\b", value, re.I):
+                    if value.lower() not in {x.lower() for x in colors}:
+                        colors.append(value)
 
     if capacities and colors:
         for storage, ram in capacities:
