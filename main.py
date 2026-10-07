@@ -4,6 +4,7 @@ import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, quote_plus
+import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
@@ -783,12 +784,26 @@ def _sitemap_product_candidates(domain, model, limit=6000):
         if not xml or "<url" not in xml.lower() and "<sitemap" not in xml.lower():
             continue
 
-        soup = BeautifulSoup(xml, "xml")
-        locs = [clean(x.get_text()) for x in soup.find_all("loc")]
+        # Use Python's built-in XML parser so GitHub Actions does not need
+        # an optional BeautifulSoup XML parser such as lxml.
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            continue
+
+        locs = []
+        for node in root.iter():
+            tag = node.tag.rsplit("}", 1)[-1].lower()
+            if tag == "loc" and node.text:
+                value = clean(node.text)
+                if value:
+                    locs.append(value)
+
         if not locs:
             continue
 
-        is_index = bool(soup.find("sitemapindex")) or "<sitemap" in xml.lower()
+        root_tag = root.tag.rsplit("}", 1)[-1].lower()
+        is_index = root_tag == "sitemapindex"
         for loc in locs:
             if not loc or not same_domain(loc, [domain]):
                 continue
