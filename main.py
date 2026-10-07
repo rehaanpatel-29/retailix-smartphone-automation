@@ -1,12 +1,11 @@
 from pathlib import Path
 import os
 import re
-import json
 import shutil
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse, quote_plus, parse_qs, parse_qs
+from urllib.parse import urljoin, urlparse, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,7 +37,6 @@ from openpyxl import load_workbook
 
 XLSX = Path("product_import_template (1).xlsx")
 IST = timezone(timedelta(hours=5, minutes=30))
-BUILD_ID = "2026-10-06-G360-GNEWS-RSS-OFFICIAL-DIRECT-VARIANTS-XIAOMI-INDEXED-CATALOGUE-FINAL"
 
 BRANDS = {
     "APPLE": ["apple.com"],
@@ -291,12 +289,6 @@ def normalize_model_name(name, brand=None):
         maxsplit=1,
         flags=re.I,
     )[0]
-    name = re.split(
-        r"\s+(?:price in india|price,?\s*availability|availability|specifications|features|review|first impressions)\b",
-        name,
-        maxsplit=1,
-        flags=re.I,
-    )[0]
     name = re.sub(r"\s*[:|,-]\s*$", "", name)
     name = re.sub(r"\s+", " ", name).strip(" -:|,")
     name = re.sub(r"^(?:the|new)\s+", "", name, flags=re.I)
@@ -350,13 +342,6 @@ EARLY_NEGATIVE_LAUNCH_WORDS = (
     "coming soon",
     "will launch",
     "launch date confirmed",
-    "goes global",
-    "going global",
-    "global launch",
-    "global debut",
-    "launched globally",
-    "launches globally",
-    "global market",
 )
 
 ARTICLE_EXCLUDE_WORDS = (
@@ -373,24 +358,14 @@ SMARTPHONE_TITLE_WORDS = (
 
 GADGETS360_MOBILES_RSS = "https://www.gadgets360.com/rss/mobiles/feeds"
 GADGETS360_MOBILES_NEWS = "https://www.gadgets360.com/mobiles/news"
-GADGETS360_TURBO_LIST = "https://turbo.gadgets360.com/list"
-GADGETS360_HINDI_NEWS = "https://hindi.gadgets360.com/mobiles/news"
-GOOGLE_NEWS_RSS_BASE = "https://news.google.com/rss/search"
-GADGETS360_OFFICIAL_HOSTS = {
-    "www.gadgets360.com",
-    "gadgets360.com",
-    "turbo.gadgets360.com",
-    "hindi.gadgets360.com",
-}
 JINA_READER_BASE = "https://r.jina.ai/"
 JINA_SEARCH_BASE = "https://s.jina.ai/"
-SEARCH_ENGINES = (
-    "https://www.google.com/search?q={query}&num=10&hl=en-IN",
-    "https://www.bing.com/search?q={query}&count=10",
-    "https://html.duckduckgo.com/html/?q={query}",
-)
 NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
 NINETYONE_MAX_PAGES = 5
+# Historical test mode needs a deeper archive scan because a test date can
+# be weeks behind the current publisher homepage. Production remains at 5.
+NINETYONE_TEST_MAX_PAGES = 40
+NINETYONE_SEARCH_ARCHIVE = "https://www.91mobiles.com/hub/search/"
 
 
 def article_is_real_india_launch(title, body):
@@ -412,11 +387,6 @@ def article_is_real_india_launch(title, body):
         return False
 
     if any(x in early for x in STRONG_LAUNCH_WORDS):
-        return True
-
-    # Allow natural article wording such as:
-    # "Samsung has launched the Galaxy A08 in India".
-    if re.search(r"\b(?:has|have|was|were|is|are)?\s*launched\b.{0,120}\bin\s+india\b", early, re.I):
         return True
 
     availability_words = (
@@ -695,265 +665,6 @@ def get_gadgets360_news_links():
     return candidates
 
 
-def _is_gadgets360_article_url(url):
-    """Return True only for official Gadgets 360 mobile-news article URLs."""
-    if not url:
-        return False
-    parsed = urlparse(url)
-    host = parsed.netloc.lower().split(":")[0]
-    path = parsed.path.lower()
-    if host not in GADGETS360_OFFICIAL_HOSTS:
-        return False
-    return (
-        (host in {"www.gadgets360.com", "gadgets360.com"} and path.startswith("/mobiles/news/"))
-        or (host == "turbo.gadgets360.com" and "/mobiles/" in path)
-        or (host == "hindi.gadgets360.com" and path.startswith("/mobiles/"))
-    )
-
-
-def _official_g360_candidate(title, url, published=None, snippet=""):
-    url = normalize_url(url)
-    if not _is_gadgets360_article_url(url):
-        return None
-    return {
-        "title": clean(title),
-        "url": url,
-        "published": published,
-        "snippet": clean(snippet),
-        "source": "gadgets360",
-    }
-
-
-def get_gadgets360_official_mirror_links():
-    """Discover G360 articles from official Turbo/Hindi listing pages."""
-    candidates = []
-    seen = set()
-    for listing_url in (GADGETS360_TURBO_LIST, GADGETS360_HINDI_NEWS):
-        html = get_html(listing_url, timeout=30)
-        if not html:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = normalize_url(a.get("href"), listing_url)
-            title = clean(a.get_text(" ", strip=True))
-            if not href or href in seen or len(title) < 12:
-                continue
-            if not _is_gadgets360_article_url(href):
-                continue
-            seen.add(href)
-            candidates.append(_official_g360_candidate(title, href))
-    return [x for x in candidates if x]
-
-
-def google_news_gadgets360_candidates(model, brand):
-    """Use Google News RSS only as a locator for official Gadgets 360 stories.
-
-    The final evidence is still the Gadgets 360 article itself. Google News is
-    not treated as a second news source; it only helps the GitHub runner find
-    an official G360 URL when G360 blocks the runner.
-    """
-    queries = [
-        f'site:gadgets360.com/mobiles/news "{model}"',
-        f'site:gadgets360.com/mobiles/news "{brand}" "{model}"',
-        f'"{model}" Gadgets 360',
-    ]
-    found = []
-    seen = set()
-
-    for query_text in queries:
-        params = {
-            "q": query_text,
-            "hl": "en-IN",
-            "gl": "IN",
-            "ceid": "IN:en",
-        }
-        try:
-            response = SESSION.get(
-                GOOGLE_NEWS_RSS_BASE,
-                params=params,
-                timeout=30,
-                headers={"Accept": "application/rss+xml, application/xml, text/xml"},
-            )
-            if not response.ok or len(response.text) < 100:
-                continue
-        except requests.RequestException:
-            continue
-
-        try:
-            root = ET.fromstring(response.text)
-        except ET.ParseError:
-            continue
-
-        for item in root.findall(".//item"):
-            title = clean(item.findtext("title"))
-            google_link = normalize_url(clean(item.findtext("link")))
-            pub_text = clean(item.findtext("pubDate"))
-            published = parse_rss_date(pub_text)
-            source_node = item.find("source")
-            source_name = clean(source_node.text if source_node is not None else "")
-            source_url = clean(source_node.get("url", "") if source_node is not None else "")
-
-            # Only accept entries explicitly attributed to Gadgets 360.
-            if "gadgets 360" not in source_name.lower() and "gadgets360.com" not in source_url.lower():
-                continue
-
-            description_raw = item.findtext("description") or ""
-            description = clean(BeautifulSoup(description_raw, "html.parser").get_text(" ", strip=True))
-            blob = f"{title} {description}".lower()
-            if model.lower() not in blob and brand.lower() not in blob:
-                continue
-
-            # Some Google News RSS entries expose the original publisher URL
-            # inside the HTML description. Prefer it when present.
-            direct_links = []
-            for match in re.finditer(
-                r'https?://(?:www\.|turbo\.|hindi\.)?gadgets360\.com/[^\s"<>]+',
-                description_raw,
-                re.I,
-            ):
-                direct = normalize_url(match.group(0).rstrip(".,;')\""))
-                if _is_gadgets360_article_url(direct):
-                    direct_links.append(direct)
-
-            if direct_links:
-                for direct in direct_links:
-                    if direct in seen:
-                        continue
-                    seen.add(direct)
-                    found.append({
-                        "title": title,
-                        "url": direct,
-                        "google_news_url": google_link,
-                        "published": published,
-                        "snippet": description,
-                        "source": "gadgets360",
-                        "publisher_name": source_name,
-                        "publisher_url": source_url,
-                        "target_model": model,
-                        "transport": "google_news_rss",
-                    })
-                continue
-
-            # Google News normally exposes a Google-hosted article link. Try
-            # to resolve it to the publisher URL, but do not require direct
-            # G360 access here; the URL can subsequently be fetched via Jina.
-            resolved = ""
-            if google_link:
-                try:
-                    rr = SESSION.get(google_link, timeout=25, allow_redirects=True)
-                    resolved = normalize_url(rr.url)
-                except requests.RequestException:
-                    resolved = ""
-
-            candidate_url = resolved if _is_gadgets360_article_url(resolved) else google_link
-            if not candidate_url or candidate_url in seen:
-                continue
-
-            # If the resolved URL is not already an official G360 article,
-            # retain the Google News URL as a transport candidate. Verification
-            # below will use Jina to follow/read it and will only accept a final
-            # official G360 article URL.
-            if not _is_gadgets360_article_url(candidate_url) and not candidate_url.startswith("https://news.google.com/"):
-                continue
-
-            seen.add(candidate_url)
-            found.append({
-                "title": title,
-                "url": candidate_url,
-                "google_news_url": google_link,
-                "published": published,
-                "snippet": description,
-                "source": "gadgets360",
-                "publisher_name": source_name,
-                "publisher_url": source_url,
-                "target_model": model,
-                "transport": "google_news_rss",
-            })
-
-    return found
-
-
-def search_engine_gadgets360_candidates(model, brand):
-    """Use public search engines only to locate official G360 article URLs.
-
-    Search engines are discovery/transport only. The resulting URL is still
-    verified against the official G360 article by verify_publisher_article().
-    """
-    queries = [
-        f'site:gadgets360.com/mobiles/news "{model}"',
-        f'site:gadgets360.com/mobiles/news "{brand}" "{model}"',
-        f'site:gadgets360.com/mobiles/news "{model}" "launched in India"',
-    ]
-    found = []
-    seen = set()
-
-    for query_text in queries:
-        encoded = quote_plus(query_text)
-        for template in SEARCH_ENGINES:
-            search_url = template.format(query=encoded)
-            html = get_html(search_url, timeout=20)
-            if not html:
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            anchors = soup.find_all("a", href=True)
-            for a in anchors:
-                href = a.get("href", "")
-                text = clean(a.get_text(" ", strip=True))
-                parent_text = clean(a.parent.get_text(" ", strip=True)) if a.parent else text
-
-                # Google / Bing / DDG wrappers.
-                if href.startswith("/url?q="):
-                    href = href.split("/url?q=", 1)[1].split("&", 1)[0]
-                elif href.startswith("https://www.google.com/url?") or href.startswith("http://www.google.com/url?"):
-                    href = parse_qs(urlparse(href).query).get("q", [""])[0]
-                elif "uddg=" in href:
-                    href = parse_qs(urlparse(href).query).get("uddg", [href.split("uddg=", 1)[1].split("&", 1)[0]])[0]
-
-                href = normalize_url(href)
-                if not _is_gadgets360_article_url(href) or href in seen:
-                    continue
-
-                # Search-result title/snippet is only a locator. It is not
-                # accepted as final launch evidence.
-                listing_date = parse_date(parent_text)
-                seen.add(href)
-                found.append(_official_g360_candidate(text, href, listing_date, parent_text))
-
-            # Some search engines expose the result URLs only in raw HTML.
-            for match in re.finditer(
-                r'https?://(?:www\.|turbo\.|hindi\.)?gadgets360\.com/[^\s"<>]+',
-                html,
-                re.I,
-            ):
-                href = normalize_url(match.group(0).rstrip(".,;')\""))
-                if not _is_gadgets360_article_url(href) or href in seen:
-                    continue
-                seen.add(href)
-                found.append(_official_g360_candidate("", href))
-
-    return [x for x in found if x]
-
-
-def gadgets360_search_fallback_candidates(n91_candidates):
-    """Locate official G360 articles when G360 blocks the GitHub runner."""
-    found = []
-    seen = set()
-    for item in n91_candidates:
-        model = item.get("name", "").strip()
-        brand = item.get("brand", "").strip()
-        if not model or not brand:
-            continue
-        for candidate in search_engine_gadgets360_candidates(model, brand):
-            if candidate["url"] in seen:
-                continue
-            seen.add(candidate["url"])
-            found.append(candidate)
-
-    print("Gadgets 360 search-engine article candidates:", len(found))
-    return found
-
-
 def direct_source_candidates(source, start, end, test_mode):
     """Discover articles from the two approved publisher sources."""
     if source == "gadgets360":
@@ -970,11 +681,6 @@ def direct_source_candidates(source, start, end, test_mode):
         if page_candidates:
             print("Gadgets 360 Mobiles News page candidates:", len(page_candidates))
             return page_candidates
-
-        mirror_candidates = get_gadgets360_official_mirror_links()
-        if mirror_candidates:
-            print("Gadgets 360 official mirror candidates:", len(mirror_candidates))
-            return mirror_candidates
 
         # Last direct-source fallback: read the official G360 Mobiles News
         # page through Jina and extract only G360 /mobiles/news/ links.
@@ -1035,6 +741,39 @@ def direct_source_candidates(source, start, end, test_mode):
     candidates = []
     seen = set()
 
+    # Normal production mode only needs the current Mobiles category pages.
+    # Historical test mode is different: the requested date may be weeks
+    # old, so the first few homepage pages cannot possibly contain it.
+    # 91mobiles exposes a paginated site-wide /hub/search/ archive, which is
+    # the correct historical locator. We scan it only in test mode and stop
+    # once the page dates are older than the requested window.
+    if test_mode:
+        max_pages = NINETYONE_TEST_MAX_PAGES
+        archive_start = start - timedelta(days=1)
+        for page in range(1, max_pages + 1):
+            url = NINETYONE_SEARCH_ARCHIVE if page == 1 else f"{NINETYONE_SEARCH_ARCHIVE}page/{page}/"
+            html = get_html(url, timeout=30)
+            if not html:
+                continue
+
+            page_candidates = parse_91mobiles_category(html)
+            page_dates = [c["published"] for c in page_candidates if c.get("published")]
+
+            for candidate in page_candidates:
+                if candidate["url"] in seen:
+                    continue
+                seen.add(candidate["url"])
+                candidates.append(candidate)
+
+            # The archive is reverse chronological. Once the oldest visible
+            # article on a page is older than the test window, later pages
+            # cannot contain a qualifying article.
+            if page_dates and max(page_dates) < archive_start:
+                break
+
+        print("91mobiles historical archive pages scanned:", page)
+        return candidates
+
     for page in range(NINETYONE_MAX_PAGES):
         if page == 0:
             url = NINETYONE_MOBILES_CATEGORY
@@ -1052,95 +791,6 @@ def direct_source_candidates(source, start, end, test_mode):
             candidates.append(candidate)
 
     return candidates
-
-
-def verify_gadgets360_google_news_metadata(candidate, brand, start, end):
-    """Verify a G360 launch from Google News RSS publisher metadata.
-
-    GitHub Actions can receive 403/blocked responses from the G360 site and
-    Jina can also fail to fetch the article. Google News RSS preserves the
-    publisher attribution, headline, publication date, and article snippet
-    supplied for the Gadgets 360 story. In that specific failure case we use
-    those fields as the transport-layer evidence while still requiring:
-      - publisher attribution = Gadgets 360
-      - smartphone launch wording
-      - selected brand
-      - matching target model from 91mobiles
-      - requested publication/launch date window
-
-    This is intentionally narrower than accepting a generic search result.
-    """
-    if candidate.get("transport") != "google_news_rss":
-        return None
-
-    publisher_name = clean(candidate.get("publisher_name", ""))
-    publisher_url = clean(candidate.get("publisher_url", ""))
-    if "gadgets 360" not in publisher_name.lower() and "gadgets360.com" not in publisher_url.lower():
-        return None
-
-    published = candidate.get("published")
-    if not published or not (start <= published <= end):
-        return None
-
-    title = clean(candidate.get("title", ""))
-    snippet = clean(candidate.get("snippet", ""))
-    evidence = clean(f"{title} {snippet}")
-    if len(title) < 10 or len(evidence) < 20:
-        return None
-
-    if not article_is_real_india_launch(title, evidence):
-        return None
-
-    title_low = title.lower()
-    if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
-        return None
-
-    if not any(x in title_low for x in SMARTPHONE_TITLE_WORDS):
-        return None
-
-    launch_words = (
-        "launched in india",
-        "has launched",
-        "launched for the indian market",
-        "now launched in india",
-        "now available in india",
-        "available in india",
-        "debuted in india",
-        "debuts in india",
-    )
-    if not any(x in evidence.lower() for x in launch_words):
-        return None
-
-    brand_from_article = detect_brand(title) or detect_brand(evidence[:15000])
-    if brand_from_article != brand:
-        return None
-
-    launch_date = extract_launch_date_from_text(evidence, published)
-    if not (start <= launch_date <= end):
-        return None
-
-    model = normalize_model_name(title, brand)
-    target_model = clean(candidate.get("target_model", ""))
-    if not model or not target_model:
-        return None
-
-    if model_key(model) != model_key(target_model):
-        return None
-
-    print(
-        f"  G360 RSS METADATA VERIFIED: {brand} {model} | "
-        f"date={launch_date.date()} | publisher=Gadgets 360"
-    )
-
-    return {
-        "brand": brand,
-        "name": target_model,
-        "release": launch_date,
-        "url": clean(candidate.get("url", "")),
-        "source": "gadgets360",
-        "article_date": published,
-        "verification_method": "google_news_rss_publisher_metadata",
-    }
 
 
 def verify_publisher_article(candidate, brand, start, end):
@@ -1168,13 +818,6 @@ def verify_publisher_article(candidate, brand, start, end):
         if jina:
             body = clean(jina.get("content", ""))
             publisher_title = clean(jina.get("title", "")) or title
-            final_url = normalize_url(jina.get("url", ""))
-            # A Google News transport URL is only useful if Jina resolves it
-            # to the actual official G360 article.
-            if url.startswith("https://news.google.com/") and not _is_gadgets360_article_url(final_url):
-                return None
-            if final_url:
-                url = final_url
             published = (
                 parse_date(jina.get("published", ""))
                 or candidate.get("published")
@@ -1201,25 +844,8 @@ def verify_publisher_article(candidate, brand, start, end):
         return None
 
     title_has_phone = any(x in title_low for x in SMARTPHONE_TITLE_WORDS)
-    if not title_has_phone:
-        return None
-
-    # Do not require the exact phrase "launched in India" in the headline.
-    # G360 headlines can use forms such as "Price in India, Launch..." while
-    # the article body explicitly confirms that the phone was launched in India.
-    early_low = clean(body[:5000]).lower()
-    if not (
-        any(x in early_low for x in STRONG_LAUNCH_WORDS)
-        or any(x in early_low for x in (
-            "has launched the",
-            "has launched",
-            "was launched in india",
-            "launched in india",
-            "launched for the indian market",
-            "now available in india",
-            "available in india",
-        ))
-    ):
+    title_has_launch = any(x in title_low for x in STRONG_LAUNCH_WORDS)
+    if not (title_has_phone and title_has_launch):
         return None
 
     brand_from_article = detect_brand(publisher_title) or detect_brand(body[:15000])
@@ -1273,38 +899,14 @@ def discover_source_candidates(source, start, end, test_mode):
 
 
 def gadgets360_fallback_candidates(n91_candidates, start, end):
-    """Locate G360 articles through Jina Search and public search engines.
-
-    Every returned URL must still be an official Gadgets 360 article and is
-    independently fetched/verified before it can qualify.
+    """
+    Locate G360 articles through Jina Search when GitHub cannot access
+    Gadgets 360 directly. Every URL is still fetched from Gadgets 360 and
+    independently verified before it can qualify.
     """
     found = []
     seen = set()
 
-    # 1) Google News RSS is a lightweight, runner-friendly locator. It is
-    # never accepted as the publisher source; only the final G360 article is.
-    for item in n91_candidates:
-        model = item.get("name", "").strip()
-        brand = item.get("brand", "").strip()
-        if not model or not brand:
-            continue
-        for candidate in google_news_gadgets360_candidates(model, brand):
-            if candidate["url"] in seen:
-                continue
-            seen.add(candidate["url"])
-            found.append(candidate)
-
-    print("Gadgets 360 Google News RSS candidates:", len(found))
-
-    # 2) Public search engines are the next recovery route when GitHub
-    # cannot fetch G360 directly.
-    for candidate in gadgets360_search_fallback_candidates(n91_candidates):
-        if candidate["url"] in seen:
-            continue
-        seen.add(candidate["url"])
-        found.append(candidate)
-
-    # 2) Jina Search remains a secondary locator.
     for item in n91_candidates:
         model = item.get("name", "").strip()
         brand = item.get("brand", "").strip()
@@ -1315,21 +917,34 @@ def gadgets360_fallback_candidates(n91_candidates, start, end):
             f'site:gadgets360.com/mobiles/news "{model}" "launched in India"',
             f'site:gadgets360.com/mobiles/news "{brand}" "{model}"',
         ]
+
         for query_text in queries:
-            for result in jina_search(query_text):
+            results = jina_search(query_text)
+            for result in results:
                 href = normalize_url(result.get("url", ""))
-                if not _is_gadgets360_article_url(href) or href in seen:
+                if not href or href in seen:
                     continue
+
+                parsed = urlparse(href)
+                if "gadgets360.com" not in parsed.netloc.lower():
+                    continue
+                if not parsed.path.lower().startswith("/mobiles/news/"):
+                    continue
+
                 seen.add(href)
                 found.append({
                     "title": clean(result.get("title", "")),
                     "url": href,
                     "published": result.get("published"),
-                    "snippet": clean(result.get("snippet", "")),
                     "source": "gadgets360",
                 })
 
-    print("Gadgets 360 total fallback article candidates:", len(found))
+            # One successful query is enough for this model; the article
+            # verifier below will decide whether any result is real evidence.
+            if any(x.get("url") for x in found if x.get("url")):
+                pass
+
+    print("Gadgets 360 Jina search article candidates:", len(found))
     return found
 
 
@@ -1352,7 +967,6 @@ def discover_launches(start, end, test_mode):
     # the SAME publisher-page verification. This does not weaken the
     # two-source rule: the final evidence still comes from Gadgets 360.
     if not g360 and n91:
-        print("Gadgets 360 direct discovery returned 0; starting all recovery methods.")
         fallback = gadgets360_fallback_candidates(n91, start, end)
         fallback_verified = {}
 
@@ -1362,25 +976,16 @@ def discover_launches(start, end, test_mode):
                 # Search snippets can omit the brand; the article verifier
                 # checks the publisher page itself, so use the 91mobiles
                 # model's brand when the model was the search target.
-                candidate_key = model_key(candidate.get("title", ""))
                 for item in n91:
-                    target_key = model_key(item["name"])
-                    if target_key and (target_key in candidate_key or candidate_key in target_key):
+                    if model_key(item["name"]) in model_key(candidate.get("title", "")):
                         brand = item["brand"]
                         break
             if not brand:
                 continue
 
-            verified = None
-            if candidate.get("transport") == "google_news_rss":
-                verified = verify_gadgets360_google_news_metadata(
-                    candidate, brand, start, end
-                )
-
-            if not verified:
-                verified = verify_publisher_article(
-                    candidate, brand, start, end
-                )
+            verified = verify_publisher_article(
+                candidate, brand, start, end
+            )
             if not verified:
                 continue
 
@@ -1503,188 +1108,10 @@ def extract_search_result_links(html, allowed_domains):
     return out
 
 
-def official_direct_product_urls(model, brand):
-    """Return deterministic official India product URLs before search-engine discovery."""
-    key = model_key(model)
-    urls = []
-
-    # Known official India pages for currently tested launches.
-    if brand == "SAMSUNG" and "galaxy a08" in key:
-        urls.extend([
-            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-dark-blue-64gb-sm-a085fdbdins/",
-            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-green-64gb-sm-a085fzgdins/",
-            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-silver-64gb-sm-a085fzsdins/",
-            "https://www.samsung.com/in/smartphones/galaxy-a/galaxy-a08-dark-blue-64gb-sm-a085fdbdins/buy/",
-        ])
-
-    if brand in {"REDMI", "POCO"}:
-        slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
-        urls.extend([
-            f"https://www.mi.com/in/product/{slug}/",
-            f"https://www.mi.com/in/product/{slug}/specs/",
-            f"https://www.mi.com/in/product/{slug}/faq/",
-            f"https://www.mi.com/in/product/{slug}/buy/",
-            "https://www.mi.com/in/product-list/",
-            "https://www.mi.com/in/product-list/redmi/",
-        ])
-
-    # Generic deterministic candidates for other selected brands.
-    slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
-    if brand == "MOTOROLA":
-        urls.extend([
-            f"https://www.motorola.in/smartphones/{slug}/",
-            f"https://www.motorola.in/smartphones/{slug}/buy/",
-        ])
-    elif brand == "ONEPLUS":
-        urls.extend([
-            f"https://www.oneplus.in/{slug}",
-            f"https://www.oneplus.in/{slug}/buy",
-        ])
-    elif brand == "REALME":
-        urls.extend([
-            f"https://www.realme.com/in/{slug}",
-            f"https://www.realme.com/in/{slug}/specs",
-        ])
-    elif brand == "VIVO":
-        urls.extend([
-            f"https://www.vivo.com/in/products/{slug}",
-        ])
-    elif brand == "OPPO":
-        urls.extend([
-            f"https://www.oppo.com/in/smartphones/series/{slug}/",
-            f"https://www.oppo.com/in/smartphones/{slug}/",
-        ])
-    elif brand == "INFINIX":
-        urls.extend([
-            f"https://infinixmobiles.in/products/{slug}",
-            f"https://www.infinixmobility.com/smartphones/{slug}",
-        ])
-
-    # Deduplicate while preserving order.
-    out = []
-    seen = set()
-    for url in urls:
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-    return out
-
-
-def fetch_official_page(url, timeout=30):
-    """Fetch an official page directly; force Jina for Xiaomi JS shells."""
-    html = get_html(url, timeout=timeout)
-
-    low_url = url.lower()
-    low_html = (html or "").lower()
-    text_len = 0
-    if html:
-        text_len = len(BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
-
-    # Xiaomi product-list pages can return a 200 OK JavaScript shell to
-    # GitHub Actions. That shell has no product cards, so do not accept it
-    # as the final source. Force the readable fallback instead.
-    xiaomi_store_shell = (
-        "mi.com/in/product-list" in low_url
-        and (
-            "javascript is not available" in low_html
-            or "enable javascript" in low_html
-            or "shop in xiaomi xiaomi india official store" in low_html
-        )
-        and text_len < 12000
-    )
-
-    if html and not xiaomi_store_shell:
-        return html
-
-    jina = jina_read_url(url, timeout=45)
-    if jina and jina.get("content"):
-        title = clean(jina.get("title", ""))
-        content = jina.get("content", "")
-        return (
-            "<html><head><title>"
-            + title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            + "</title></head><body>"
-            + content
-            + "</body></html>"
-        )
-
-    return html or ""
-
-
 def find_official_product_page(model, brand):
-    """Find an official India product page without depending on Google/Bing."""
     domains = BRANDS[brand]
     candidates = []
 
-    # 1) Deterministic official URLs first. This is the important path for
-    # GitHub Actions, where search engines and some brand search pages can fail.
-    direct_pages = []
-    for url in official_direct_product_urls(model, brand):
-        html = fetch_official_page(url, timeout=30)
-        if not html:
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        body = clean(soup.get_text(" ", strip=True))
-        low = body.lower()
-        model_words = [
-            w.lower() for w in re.findall(r"[A-Za-z0-9]+", model) if len(w) >= 3
-        ]
-
-        # Xiaomi product-list pages are catalogue pages, not single-product
-        # pages. Their readable/Jina representation can omit the exact model
-        # from the page-level title/body even though the individual product
-        # card (alt/title/aria-label/text) contains the model and variant.
-        # Do not reject those catalogue pages at this gate; extract_variants()
-        # performs the exact model + explicit colour/RAM/storage matching.
-        is_xiaomi_catalogue = (
-            brand in {"REDMI", "POCO"}
-            and "mi.com/in/product-list" in url.lower()
-        )
-
-        if (not is_xiaomi_catalogue) and model_words and not all(
-            w in low for w in model_words[:2]
-        ):
-            continue
-        if not official_page_is_india(url) and "india" not in low:
-            continue
-
-        direct_pages.append((url, html))
-
-    if direct_pages:
-        # Samsung publishes one India product URL per colour/SKU. Combine the
-        # verified official pages so the variant extractor can retain every
-        # explicitly published colour/SKU without inventing combinations.
-        if brand == "SAMSUNG" and len(direct_pages) > 1:
-            combined = "<html><body>" + "".join(
-                f'<section data-source="{url}">{html}</section>'
-                for url, html in direct_pages
-            ) + "</body></html>"
-            print("Official India pages (direct):", len(direct_pages))
-            return direct_pages[0][0], combined
-
-        if brand in {"REDMI", "POCO"} and len(direct_pages) > 1:
-            # Xiaomi publishes the product description, specs and FAQ on
-            # separate official India URLs. Combine only those verified
-            # official pages so description/variant extraction can inspect
-            # all source material without using third-party data.
-            combined = "<html><body>" + "".join(
-                f'<section data-source="{url}">{html}</section>'
-                for url, html in direct_pages
-            ) + "</body></html>"
-            print("Official India pages (direct):", len(direct_pages))
-            catalogue_count = sum(
-                1 for page_url, _ in direct_pages
-                if "mi.com/in/product-list" in page_url.lower()
-            )
-            if catalogue_count:
-                print("Xiaomi official catalogue pages included:", catalogue_count)
-            return direct_pages[0][0], combined
-
-        print("Official India page (direct):", direct_pages[0][0])
-        return direct_pages[0][0], direct_pages[0][1]
-
-    # 2) Existing search-engine discovery as a secondary method.
     for search_url in official_search_urls(model, domains):
         html = get_html(search_url, timeout=20)
         if not html:
@@ -1703,6 +1130,7 @@ def find_official_product_page(model, brand):
                 if len(word) >= 3 and word in blob:
                     score += 1
 
+            # Avoid support, manuals, careers, and generic landing pages.
             if any(x in href.lower() for x in (
                 "/support", "/help", "/careers", "/about",
                 "/privacy", "/terms", "/store-locator",
@@ -1719,23 +1147,28 @@ def find_official_product_page(model, brand):
     for score, url in candidates:
         if score < 5:
             continue
-        html = fetch_official_page(url, timeout=30)
+        html = get_html(url, timeout=30)
         if not html:
             continue
 
         soup = BeautifulSoup(html, "html.parser")
         body = clean(soup.get_text(" ", strip=True))
         low = body.lower()
+
         model_words = [
-            w.lower() for w in re.findall(r"[A-Za-z0-9]+", model) if len(w) >= 3
+            w.lower()
+            for w in re.findall(r"[A-Za-z0-9]+", model)
+            if len(w) >= 3
         ]
 
         if model_words and not all(w in low for w in model_words[:2]):
             continue
+
+        # India confirmation. URL can be global-looking, but page must
+        # contain India when the URL itself doesn't establish India.
         if not official_page_is_india(url) and "india" not in low:
             continue
 
-        print("Official India page (search):", url)
         return url, html
 
     return "", ""
@@ -1774,13 +1207,6 @@ def product_name_from_official(html, fallback):
 
 
 def official_description(html, model):
-    """Extract product description strictly from the official India page.
-
-    Some Xiaomi India product pages render the useful description inside the
-    page body / structured content rather than a normal <p> or meta tag.
-    The fallback below reads only text already present in the official page
-    and never fabricates product copy.
-    """
     soup = BeautifulSoup(html, "html.parser")
 
     for attrs in (
@@ -1814,63 +1240,6 @@ def official_description(html, model):
     if paragraphs:
         return " ".join(paragraphs[:4])[:2000]
 
-    # Xiaomi India can expose the main product copy as rendered body text
-    # without wrapping it in <p>/<li>. Read that official text as-is.
-    full_text = clean(soup.get_text(" ", strip=True))
-    if len(full_text) >= 60:
-        model_re = re.compile(re.escape(model), re.I)
-        matches = list(model_re.finditer(full_text))
-
-        # Prefer a product-introduction / product-description occurrence
-        # instead of a navigation/header occurrence.
-        preferred_terms = (
-            "introducing", "designed", "features", "powered by",
-            "display", "battery", "camera", "performance",
-        )
-        best = None
-        best_score = -1
-        for m in matches:
-            start = max(0, m.start() - 250)
-            end = min(len(full_text), m.end() + 1800)
-            window = full_text[start:end]
-            low_window = window.lower()
-            score = sum(2 for term in preferred_terms if term in low_window)
-            if len(window) >= 250:
-                score += 1
-            if score > best_score:
-                best_score = score
-                best = window
-
-        if best:
-            # Keep complete-looking sentences where possible and strip
-            # obvious navigation fragments. This remains source text, not
-            # generated copy.
-            sentences = re.split(r"(?<=[.!?])\s+", best)
-            useful = []
-            for sentence in sentences:
-                sentence = clean(sentence)
-                low = sentence.lower()
-                if len(sentence) < 35:
-                    continue
-                if any(x in low for x in (
-                    "sign in", "store", "support", "shop and learn",
-                    "privacy", "terms", "cookie", "javascript",
-                )):
-                    continue
-                if (
-                    model.lower() in low
-                    or any(x in low for x in (
-                        "smartphone", "phone", "battery", "camera",
-                        "display", "processor", "performance", "designed",
-                    ))
-                ):
-                    useful.append(sentence)
-
-            if useful:
-                return " ".join(useful[:6])[:2000]
-
-            return clean(best)[:2000]
-
     return ""
 
 
@@ -1890,26 +1259,6 @@ def extract_variants(html, model):
     """
     soup = BeautifulSoup(html, "html.parser")
     found = []
-
-    # Samsung India uses SKU-specific pages whose title explicitly contains
-    # RAM/storage and colour, e.g. "4GB/64GB - (Dark Blue)". Read that exact
-    # published combination instead of constructing a Cartesian product.
-    samsung_title_re = re.compile(
-        r"(?P<ram>\d{1,2})\s*GB\s*/\s*"
-        r"(?P<storage>\d{2,4})\s*GB.*?\((?P<color>[^)]+)\)",
-        re.I,
-    )
-    for tag in soup.find_all("title"):
-        title_text = clean(tag.get_text(" ", strip=True))
-        m = samsung_title_re.search(title_text)
-        if m:
-            item = (
-                clean(m.group("color")),
-                normalize_capacity(f"{m.group('storage')} GB"),
-                normalize_capacity(f"{m.group('ram')} GB"),
-            )
-            if item not in found:
-                found.append(item)
 
     ram_storage = re.compile(
         r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
@@ -1970,324 +1319,11 @@ def extract_variants(html, model):
                 if item not in found:
                     found.append(item)
 
-    # Xiaomi's official India store product-list pages can expose an
-    # explicit product-card label such as:
-    #   "REDMI 17C 5G Coffee Brew 4 GB + 128 GB"
-    # Treat that label as a valid pairing because colour + RAM + storage
-    # occur together in the same official card/alt text. This is NOT a
-    # Cartesian product and does not infer any other colour/configuration.
-    model_low = clean(model).lower()
-    paired_text_re = re.compile(
-        rf"{re.escape(model_low)}\s+(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
-        rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
-        rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
-        re.I,
-    )
-    for tag in soup.find_all(["img", "a", "span", "div", "p", "li"]):
-        values = []
-        for attr in ("alt", "title", "aria-label", "data-title", "data-name"):
-            value = tag.get(attr)
-            if value:
-                values.append(clean(value))
-        text = clean(tag.get_text(" ", strip=True))
-        if text and len(text) <= 180:
-            values.append(text)
-
-        for value in values:
-            m = paired_text_re.search(value)
-            if not m:
-                continue
-            color = clean(m.group("color")).strip(" -|,")
-            if not (2 <= len(color) <= 45):
-                continue
-            item = (
-                color,
-                normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
-                normalize_capacity(f"{m.group('ram')} GB"),
-            )
-            if item not in found:
-                found.append(item)
-
-    # Xiaomi catalogue pages may arrive through Jina as flattened Markdown/text
-    # where the product-card label is not preserved in img/anchor attributes.
-    # Parse the official catalogue text itself. A pairing is accepted only
-    # when model + colour + RAM + storage occur in the same bounded segment.
-    is_xiaomi_catalogue = (
-        "mi.com/in/product-list" in html.lower()
-        or any(
-            "mi.com/in/product-list" in s.get("data-source", "").lower()
-            for s in soup.find_all("section")
-        )
-    )
-    if is_xiaomi_catalogue:
-        catalogue_text = clean(soup.get_text(" ", strip=True))
-        model_pattern = re.escape(clean(model))
-
-        # Exact Xiaomi card form, e.g.
-        # "REDMI 17C 5G Coffee Brew 4 GB + 128 GB".
-        card_re = re.compile(
-            rf"{model_pattern}\s+"
-            rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
-            rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
-            rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
-            re.I,
-        )
-
-        for m in card_re.finditer(catalogue_text):
-            color = clean(m.group("color")).strip(" -|,:")
-            if not (2 <= len(color) <= 45):
-                continue
-            if color.lower() in {
-                "select", "choose", "available", "variant", "color", "colour",
-            }:
-                continue
-            item = (
-                color,
-                normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
-                normalize_capacity(f"{m.group('ram')} GB"),
-            )
-            if item not in found:
-                found.append(item)
-
-        # Jina may put the model and its configuration on adjacent lines.
-        # Keep the window deliberately small so separate product cards cannot
-        # accidentally be combined.
-        lines = [
-            clean(x) for x in soup.get_text("\n", strip=True).splitlines()
-            if clean(x)
-        ]
-        for idx, line in enumerate(lines):
-            if not re.search(model_pattern, line, re.I):
-                continue
-            window = " ".join(lines[idx:idx + 2])
-            m = re.search(
-                rf"{model_pattern}\s+"
-                rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
-                rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
-                rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
-                window,
-                re.I,
-            )
-            if not m:
-                continue
-            color = clean(m.group("color")).strip(" -|,:")
-            if not (2 <= len(color) <= 45):
-                continue
-            item = (
-                color,
-                normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
-                normalize_capacity(f"{m.group('ram')} GB"),
-            )
-            if item not in found:
-                found.append(item)
-
-    # Xiaomi India catalogue pages are client-rendered and may return only a
-    # JavaScript shell to GitHub Actions. In that case, use a Google index lookup
-    # ONLY as a locator for an official mi.com India catalogue result. The
-    # accepted variant still must be present in the indexed snippet together with
-    # the exact model + colour + RAM + storage, and the result URL must be mi.com.
-    # This is not a Cartesian product and does not use third-party product data.
-    if is_xiaomi_catalogue and not found:
-        try:
-            search_q = quote_plus(
-                f'site:mi.com/in/product-list "{model}" "GB +"'
-            )
-            search_url = f"https://www.google.com/search?q={search_q}&num=10"
-            search_html = get_html(search_url, timeout=20)
-            if search_html:
-                ssoup = BeautifulSoup(search_html, "html.parser")
-                for a in ssoup.find_all("a", href=True):
-                    href = a.get("href", "")
-                    if "mi.com/in/product-list" not in href.lower():
-                        continue
-                    parent = a
-                    for _ in range(4):
-                        parent = parent.parent if parent.parent else parent
-                    snippet = clean(parent.get_text(" ", strip=True))
-                    if not snippet or len(snippet) > 1200:
-                        continue
-
-                    # Require the exact official catalogue-card shape in the
-                    # indexed text. Do not accept separate lists of colours and
-                    # configurations.
-                    m = re.search(
-                        rf"{re.escape(clean(model))}\s+"
-                        rf"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{{2,45}}?)\s+"
-                        rf"(?P<ram>\d{{1,2}})\s*GB\s*\+\s*"
-                        rf"(?P<storage>\d{{2,4}})\s*(?P<unit>GB|TB)\b",
-                        snippet,
-                        re.I,
-                    )
-                    if not m:
-                        continue
-                    color = clean(m.group("color")).strip(" -|,:")
-                    if not (2 <= len(color) <= 45):
-                        continue
-                    item = (
-                        color,
-                        normalize_capacity(f"{m.group('storage')} {m.group('unit').upper()}"),
-                        normalize_capacity(f"{m.group('ram')} GB"),
-                    )
-                    if item not in found:
-                        found.append(item)
-                        print(
-                            "Xiaomi official catalogue index verified:",
-                            color, "|", item[1], "|", item[2]
-                        )
-        except Exception as exc:
-            print("Xiaomi catalogue index fallback unavailable:", type(exc).__name__)
-
     # JSON/script blocks can contain explicit variant objects.
-    # Xiaomi pages often keep variant state in nested JSON objects rather
-    # than visible HTML.  Inspect each JSON object independently so we only
-    # accept a colour + RAM + storage combination that is explicitly paired
-    # in the same object.  We never combine separate colour/config lists.
-    def add_explicit_mapping(mapping):
-        if not isinstance(mapping, dict):
-            return
-
-        color_value = None
-        ram_value = None
-        storage_value = None
-
-        # First pass: direct scalar fields with variant semantics.
-        for key, value in mapping.items():
-            if isinstance(value, (dict, list, tuple)):
-                continue
-            key_low = str(key).lower().replace("_", " ").replace("-", " ")
-            value_text = clean(str(value))
-            if not value_text or len(value_text) > 120:
-                continue
-
-            if color_value is None and (
-                "color" in key_low or "colour" in key_low
-            ):
-                color_value = value_text
-            elif ram_value is None and (
-                "ram" in key_low or "memory" in key_low
-            ) and re.search(r"\d{1,2}\s*GB", value_text, re.I):
-                ram_value = value_text
-            elif storage_value is None and (
-                "storage" in key_low or "rom" in key_low
-            ) and re.search(r"\d{2,4}\s*(?:GB|TB)", value_text, re.I):
-                storage_value = value_text
-
-        # Some Xiaomi objects store the full config in one field such as
-        # "4GB + 128GB" while colour is a separate scalar field.
-        if color_value and (ram_value is None or storage_value is None):
-            for key, value in mapping.items():
-                if isinstance(value, (dict, list, tuple)):
-                    continue
-                value_text = clean(str(value))
-                m = re.search(
-                    r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
-                    r"(?:\+|/|\||,|with)\s*"
-                    r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
-                    value_text,
-                    re.I,
-                )
-                if m:
-                    ram_value = ram_value or f"{m.group('ram')} GB"
-                    storage_value = storage_value or (
-                        f"{m.group('storage')} {m.group('unit').upper()}"
-                    )
-                    break
-
-        # Or the object may store the whole variant in one scalar string.
-        if not color_value:
-            for key, value in mapping.items():
-                if isinstance(value, (dict, list, tuple)):
-                    continue
-                value_text = clean(str(value))
-                m = re.search(
-                    r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
-                    r"(?:\+|/|\||,|with)\s*"
-                    r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
-                    value_text,
-                    re.I,
-                )
-                if not m:
-                    continue
-                # Look for a colour-like field in the same mapping.
-                for k2, v2 in mapping.items():
-                    if isinstance(v2, (dict, list, tuple)):
-                        continue
-                    k2_low = str(k2).lower()
-                    if "color" in k2_low or "colour" in k2_low:
-                        color_value = clean(str(v2))
-                        break
-                if color_value:
-                    ram_value = ram_value or f"{m.group('ram')} GB"
-                    storage_value = storage_value or (
-                        f"{m.group('storage')} {m.group('unit').upper()}"
-                    )
-                    break
-
-        if not (color_value and ram_value and storage_value):
-            return
-
-        # Normalize values while preserving the explicitly published colour.
-        color_value = re.sub(
-            r"\s+(?:ram|storage|memory|price|₹|\|)\b",
-            " ",
-            color_value,
-            flags=re.I,
-        ).strip(" -|,")
-        if not (2 <= len(color_value) <= 45):
-            return
-        if color_value.lower() in {
-            "select", "choose", "available", "variant", "color", "colour"
-        }:
-            return
-
-        ram_m = re.search(r"(\d{1,2})\s*GB", ram_value, re.I)
-        storage_m = re.search(
-            r"(\d{2,4})\s*(GB|TB)", storage_value, re.I
-        )
-        if not (ram_m and storage_m):
-            return
-
-        item = (
-            clean(color_value),
-            normalize_capacity(
-                f"{storage_m.group(1)} {storage_m.group(2).upper()}"
-            ),
-            normalize_capacity(f"{ram_m.group(1)} GB"),
-        )
-        if item not in found:
-            found.append(item)
-
-    def walk_json(value):
-        if isinstance(value, dict):
-            add_explicit_mapping(value)
-            for child in value.values():
-                walk_json(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk_json(child)
-
     for tag in soup.find_all("script"):
         raw = tag.string or tag.get_text()
         if not raw or len(raw) > 700000:
             continue
-
-        script_type = (tag.get("type") or "").lower()
-        if "json" in script_type or tag.get("id") in {"__NEXT_DATA__", "__NUXT_DATA__"}:
-            try:
-                parsed = json.loads(raw)
-                walk_json(parsed)
-            except Exception:
-                pass
-
-        # Also inspect JSON-looking script payloads even when the site did not
-        # declare a JSON MIME type.  This is intentionally best-effort; the
-        # scalar-object rule above prevents separate lists from being paired.
-        if raw.lstrip().startswith(("{", "[")):
-            try:
-                parsed = json.loads(raw)
-                walk_json(parsed)
-            except Exception:
-                pass
 
         for pm in ram_storage.finditer(raw):
             ram = f"{pm.group('ram')} GB"
@@ -2477,9 +1513,7 @@ def load_existing(ws):
 def main():
     print("=" * 78)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
-    print(f"BUILD: {BUILD_ID}")
-    print("DISCOVERY: 91MOBILES + GADGETS 360 OFFICIAL SOURCES + RECOVERY")
-    print("G360 RECOVERY: Google News RSS publisher metadata -> G360/Jina verification")
+    print("DISCOVERY: 91MOBILES + GADGETS 360 DIRECT")
     print("DATA: OFFICIAL INDIA BRAND WEBSITE")
     print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
     print("=" * 78)
