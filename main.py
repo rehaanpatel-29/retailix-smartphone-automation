@@ -108,12 +108,28 @@ def same_domain(url, domains):
 
 
 def get_html(url, timeout=30):
-    try:
-        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
-        if r.ok and len(r.text) > 300:
-            return r.text
-    except requests.RequestException:
-        pass
+    """Fetch a page; for Gadgets 360, retry its own AMP representation.
+
+    The AMP retry is still the same Gadgets 360 publisher content. It is
+    only a transport/accessibility fallback for runners that receive 403s
+    from the normal page. No external search or news source is consulted.
+    """
+    urls = [url]
+    parsed = urlparse(url)
+    if "gadgets360.com" in parsed.netloc.lower():
+        path = parsed.path
+        if path and not path.endswith("/amp") and path.startswith("/mobiles/news/"):
+            urls.append(url.rstrip("/") + "/amp")
+        elif path == "/mobiles/news":
+            urls.append(GADGETS360_MOBILES_AMP if "GADGETS360_MOBILES_AMP" in globals() else "https://www.gadgets360.com/mobiles/amp")
+
+    for target in urls:
+        try:
+            r = SESSION.get(target, timeout=timeout, allow_redirects=True)
+            if r.ok and len(r.text) > 300:
+                return r.text
+        except requests.RequestException:
+            continue
     return ""
 
 
@@ -358,8 +374,7 @@ SMARTPHONE_TITLE_WORDS = (
 
 GADGETS360_MOBILES_RSS = "https://www.gadgets360.com/rss/mobiles/feeds"
 GADGETS360_MOBILES_NEWS = "https://www.gadgets360.com/mobiles/news"
-JINA_READER_BASE = "https://r.jina.ai/"
-JINA_SEARCH_BASE = "https://s.jina.ai/"
+GADGETS360_MOBILES_AMP = "https://www.gadgets360.com/mobiles/amp"
 NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
 NINETYONE_MAX_PAGES = 5
 # Historical test mode needs a deeper archive scan because a test date can
@@ -427,23 +442,6 @@ def parse_publisher_listing_date(text):
     return parse_date(text)
 
 
-def extract_published_date_from_text(text):
-    """Extract a publisher Published/Updated date from Jina's text output."""
-    text = clean(text)
-    patterns = [
-        r"(?:published|updated)(?:\s+on|\s*:)?\s+(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2})",
-        r"(?:published|updated)(?:\s+on|\s*:)?\s+([A-Za-z]+\s+\d{1,2},\s*20\d{2})",
-        r"(?:published|updated)(?:\s+on|\s*:)?\s+(\d{1,2}[/-]\d{1,2}[/-]20\d{2})",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            dt = parse_date(m.group(1))
-            if dt:
-                return dt
-    return None
-
-
 def parse_gadgets360_rss(xml):
     """Parse the official Gadgets 360 Mobiles RSS feed."""
     try:
@@ -474,110 +472,6 @@ def parse_gadgets360_rss(xml):
         })
 
     return candidates
-
-
-def jina_read_url(url, timeout=45):
-    """Read a URL through Jina Reader when the GitHub runner cannot fetch it directly."""
-    if not url:
-        return None
-
-    reader_url = JINA_READER_BASE + url
-    try:
-        response = SESSION.get(
-            reader_url,
-            timeout=timeout,
-            headers={
-                "Accept": "application/json",
-                "X-Retain-Links": "true",
-                "X-With-Links-Summary": "true",
-            },
-        )
-        if not response.ok or len(response.text) < 100:
-            return None
-
-        try:
-            payload = response.json()
-        except ValueError:
-            return {
-                "url": url,
-                "title": "",
-                "content": response.text,
-            }
-
-        data = payload.get("data", payload) if isinstance(payload, dict) else payload
-        if not isinstance(data, dict):
-            return None
-
-        content = clean(data.get("content", ""))
-        title = clean(data.get("title", ""))
-        final_url = clean(data.get("url", "")) or url
-
-        if not content:
-            return None
-
-        return {
-            "url": final_url,
-            "title": title,
-            "content": content,
-        }
-    except requests.RequestException:
-        return None
-
-
-def jina_search(query, timeout=45):
-    """Search the web through Jina and return normalized result dictionaries."""
-    if not query:
-        return []
-
-    search_url = JINA_SEARCH_BASE + quote_plus(query)
-    try:
-        response = SESSION.get(
-            search_url,
-            timeout=timeout,
-            headers={
-                "Accept": "application/json",
-            },
-        )
-        if not response.ok or len(response.text) < 50:
-            return []
-
-        results = []
-        try:
-            payload = response.json()
-        except ValueError:
-            # Jina can return readable Markdown. Extract the source URLs
-            # directly from Markdown links as a fallback.
-            for match in re.finditer(
-                r"\[[^\]]+\]\((https?://[^)]+)\)", response.text
-            ):
-                results.append({
-                    "title": "",
-                    "url": normalize_url(match.group(1)),
-                    "published": None,
-                })
-            return results
-
-        data = payload.get("data", payload) if isinstance(payload, dict) else payload
-        if isinstance(data, dict):
-            data = data.get("results", data.get("items", []))
-        if not isinstance(data, list):
-            return []
-
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            url = normalize_url(item.get("url", ""))
-            if not url:
-                continue
-            results.append({
-                "title": clean(item.get("title", "")),
-                "url": url,
-                "published": parse_date(item.get("published", "")),
-            })
-
-        return results
-    except requests.RequestException:
-        return []
 
 
 def parse_91mobiles_category(html):
@@ -665,88 +559,67 @@ def get_gadgets360_news_links():
     return candidates
 
 
+
 def direct_source_candidates(source, start, end, test_mode):
     """Discover articles from the two approved publisher sources."""
     if source == "gadgets360":
-        # RSS is useful when accessible, but GitHub Actions can receive 403.
+        # Gadgets 360 is a required confirmation source.
+        # Try only Gadgets 360's own RSS and Mobiles News page.
+        # If neither provides usable data, return no candidates and let the
+        # cross-check logic skip the 91mobiles candidate.
         xml = get_html(GADGETS360_MOBILES_RSS, timeout=30)
         if xml:
             rss_candidates = parse_gadgets360_rss(xml)
             if rss_candidates:
+                print("Gadgets 360 RSS candidates:", len(rss_candidates))
                 return rss_candidates
-        else:
-            print("Gadgets 360 RSS unavailable; using Mobiles News page fallback.")
+
+        print("Gadgets 360 RSS unavailable.")
 
         page_candidates = get_gadgets360_news_links()
         if page_candidates:
             print("Gadgets 360 Mobiles News page candidates:", len(page_candidates))
             return page_candidates
 
-        # Last direct-source fallback: read the official G360 Mobiles News
-        # page through Jina and extract only G360 /mobiles/news/ links.
-        jina = jina_read_url(GADGETS360_MOBILES_NEWS)
-        if jina:
-            text = jina.get("content", "")
-            candidates = []
-            seen = set()
-
-            # Jina normally preserves publisher links as Markdown. Capture
-            # both the article title and the exact G360 URL so the normal
-            # brand/title pre-filter can work before article verification.
-            for match in re.finditer(
-                r"\[([^\]]{10,200})\]\((https?://(?:www\.)?gadgets360\.com/mobiles/news/[^)]+)\)",
-                text,
-                re.I,
-            ):
-                title = clean(match.group(1))
-                href = normalize_url(match.group(2).rstrip(".,;"))
+        # Some GitHub runners are blocked on the normal G360 news page, while
+        # the publisher's AMP mobile index remains reachable. This is still
+        # Gadgets 360 data; it is not a third-party discovery source.
+        amp_html = get_html(GADGETS360_MOBILES_AMP, timeout=30)
+        if amp_html:
+            soup = BeautifulSoup(amp_html, "html.parser")
+            amp_candidates, seen = [], set()
+            for a in soup.find_all("a", href=True):
+                href = normalize_url(a.get("href"), GADGETS360_MOBILES_AMP)
+                title = clean(a.get_text(" ", strip=True))
+                parsed = urlparse(href)
                 if not href or href in seen:
+                    continue
+                if "gadgets360.com" not in parsed.netloc.lower():
+                    continue
+                if not parsed.path.lower().startswith("/mobiles/news/"):
                     continue
                 if len(title) < 20:
                     continue
                 seen.add(href)
-                candidates.append({
+                amp_candidates.append({
                     "title": title,
                     "url": href,
                     "published": None,
                     "source": "gadgets360",
                 })
+            if amp_candidates:
+                print("Gadgets 360 AMP candidates:", len(amp_candidates))
+                return amp_candidates
 
-            # If the response contains bare URLs instead of Markdown links,
-            # retain them as a secondary locator.
-            if not candidates:
-                for match in re.finditer(
-                    r"https?://(?:www\.)?gadgets360\.com/mobiles/news/[^\s)\]]+",
-                    text,
-                    re.I,
-                ):
-                    href = normalize_url(match.group(0).rstrip(".,;"))
-                    if not href or href in seen:
-                        continue
-                    seen.add(href)
-                    candidates.append({
-                        "title": "",
-                        "url": href,
-                        "published": None,
-                        "source": "gadgets360",
-                    })
-
-            if candidates:
-                print("Gadgets 360 Mobiles News page via Jina:", len(candidates))
-                return candidates
-
-        print("Gadgets 360 Mobiles News page unavailable.")
+        print("Gadgets 360 did not provide usable discovery data; skipping G360 confirmation.")
         return []
 
     candidates = []
     seen = set()
 
     # Normal production mode only needs the current Mobiles category pages.
-    # Historical test mode is different: the requested date may be weeks
-    # old, so the first few homepage pages cannot possibly contain it.
-    # 91mobiles exposes a paginated site-wide /hub/search/ archive, which is
-    # the correct historical locator. We scan it only in test mode and stop
-    # once the page dates are older than the requested window.
+    # Historical test mode scans the 91mobiles archive because the requested
+    # date may be weeks behind the current publisher homepage.
     if test_mode:
         max_pages = NINETYONE_TEST_MAX_PAGES
         archive_start = start - timedelta(days=1)
@@ -765,9 +638,6 @@ def direct_source_candidates(source, start, end, test_mode):
                 seen.add(candidate["url"])
                 candidates.append(candidate)
 
-            # The archive is reverse chronological. Once the oldest visible
-            # article on a page is older than the test window, later pages
-            # cannot contain a qualifying article.
             if page_dates and max(page_dates) < archive_start:
                 break
 
@@ -775,11 +645,7 @@ def direct_source_candidates(source, start, end, test_mode):
         return candidates
 
     for page in range(NINETYONE_MAX_PAGES):
-        if page == 0:
-            url = NINETYONE_MOBILES_CATEGORY
-        else:
-            url = f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
-
+        url = NINETYONE_MOBILES_CATEGORY if page == 0 else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
         html = get_html(url, timeout=30)
         if not html:
             continue
@@ -803,31 +669,19 @@ def verify_publisher_article(candidate, brand, start, end):
     body = ""
     published = None
 
-    # G360 is frequently blocked from GitHub-hosted runners. Try the real
-    # publisher URL first; if that fails, use Jina Reader only as a transport
-    # layer to fetch the SAME G360 article. The source remains G360.
+    # Always verify the actual publisher article directly.
+    # If Gadgets 360 blocks the GitHub runner or does not return usable HTML,
+    # verification fails and the candidate is skipped. No third-party
+    # transport or search source is used.
     html = get_html(url, timeout=30)
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        body = clean(soup.get_text(" ", strip=True))
-        h1 = soup.find("h1")
-        publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
-        published = article_date(html) or candidate.get("published")
-    elif candidate.get("source") == "gadgets360":
-        jina = jina_read_url(url)
-        if jina:
-            body = clean(jina.get("content", ""))
-            publisher_title = clean(jina.get("title", "")) or title
-            published = (
-                parse_date(jina.get("published", ""))
-                or candidate.get("published")
-                or extract_published_date_from_text(body[:12000])
-            )
-            print("  G360 article fetched via Jina:", url)
-        else:
-            return None
-    else:
+    if not html:
         return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    body = clean(soup.get_text(" ", strip=True))
+    h1 = soup.find("h1")
+    publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
+    published = article_date(html) or candidate.get("published")
 
     if len(publisher_title) < 10:
         publisher_title = title
@@ -874,9 +728,6 @@ def discover_source_candidates(source, start, end, test_mode):
     out = {}
     raw_candidates = direct_source_candidates(source, start, end, test_mode)
 
-    # Use the publisher listing/feed date as a cheap pre-filter when present.
-    # If it is missing, still verify the article because its own metadata is
-    # authoritative and may contain the date.
     for candidate in raw_candidates:
         listing_date = candidate.get("published")
         if listing_date and listing_date < start - timedelta(days=1):
@@ -898,136 +749,21 @@ def discover_source_candidates(source, start, end, test_mode):
     return list(out.values())
 
 
-def resolve_url(url, timeout=20):
-    """Resolve a locator URL and return its final URL."""
-    if not url:
-        return ""
-    try:
-        response = SESSION.get(url, timeout=timeout, allow_redirects=True,
-                               headers={"User-Agent": SESSION.headers.get("User-Agent", "Mozilla/5.0")})
-        return normalize_url(response.url) if response.url else ""
-    except requests.RequestException:
-        return ""
-
-
-def google_news_gadgets360_candidates(model, brand, start, end):
-    """Use Google News RSS only as a locator for a Gadgets 360 article."""
-    query = f'site:gadgets360.com/mobiles/news "{model}" "launched in India"'
-    rss_url = ("https://news.google.com/rss/search?q=" + quote_plus(query)
-               + "&hl=en-IN&gl=IN&ceid=IN:en")
-    try:
-        response = SESSION.get(rss_url, timeout=30,
-                               headers={"User-Agent": SESSION.headers.get("User-Agent", "Mozilla/5.0"),
-                                        "Accept": "application/rss+xml,application/xml,text/xml"})
-        if not response.ok or len(response.text) < 100:
-            return []
-        root = ET.fromstring(response.text)
-    except (requests.RequestException, ET.ParseError):
-        return []
-
-    found, seen = [], set()
-    for item in root.findall(".//item"):
-        title = clean(item.findtext("title"))
-        link = clean(item.findtext("link"))
-        source_el = item.find("source")
-        publisher = clean(source_el.text if source_el is not None else "")
-        published = parse_rss_date(clean(item.findtext("pubDate")))
-        if not link or publisher.lower() != "gadgets 360":
-            continue
-        if published and not (start - timedelta(days=2) <= published <= end + timedelta(days=2)):
-            continue
-        final_url = resolve_url(link)
-        parsed = urlparse(final_url)
-        if "gadgets360.com" not in parsed.netloc.lower() or not parsed.path.lower().startswith("/mobiles/news/"):
-            continue
-        if final_url in seen:
-            continue
-        seen.add(final_url)
-        found.append({"title": title, "url": final_url, "published": published, "source": "gadgets360"})
-    return found
-
-
-def gadgets360_fallback_candidates(n91_candidates, start, end):
-    """Locate G360 articles when its RSS/site is blocked; search is locator-only."""
-    found, seen = [], set()
-    for item in n91_candidates:
-        model = item.get("name", "").strip()
-        brand = item.get("brand", "").strip()
-        if not model or not brand:
-            continue
-
-        # Primary recovery: Google News RSS, restricted to publisher Gadgets 360.
-        for candidate in google_news_gadgets360_candidates(model, brand, start, end):
-            if candidate["url"] not in seen:
-                seen.add(candidate["url"]); found.append(candidate)
-
-        # Secondary locator: Jina Search.
-        for query_text in (
-            f'site:gadgets360.com/mobiles/news "{model}" "launched in India"',
-            f'site:gadgets360.com/mobiles/news "{brand}" "{model}"',
-        ):
-            for result in jina_search(query_text):
-                href = normalize_url(result.get("url", ""))
-                parsed = urlparse(href)
-                if (not href or "gadgets360.com" not in parsed.netloc.lower()
-                        or not parsed.path.lower().startswith("/mobiles/news/")
-                        or href in seen):
-                    continue
-                seen.add(href)
-                found.append({"title": clean(result.get("title", "")),
-                              "url": href, "published": result.get("published"),
-                              "source": "gadgets360"})
-    print("Gadgets 360 recovery article candidates:", len(found))
-    return found
-
-
 def discover_launches(start, end, test_mode):
     """
     Discovery and verification rule:
 
       1. 91mobiles and Gadgets 360 are queried directly.
-      2. The actual publisher articles are independently verified.
+      2. The actual publisher articles are independently verified directly.
       3. Both publishers must report the same selected-brand phone as
          launched in India.
       4. Their India launch dates must agree.
-      5. Only phones inside the requested window qualify.
+      5. If Gadgets 360 is unavailable or does not provide the required data,
+         the phone is skipped.
+      6. Only phones inside the requested window qualify.
     """
     n91 = discover_source_candidates("91mobiles", start, end, test_mode)
     g360 = discover_source_candidates("gadgets360", start, end, test_mode)
-
-    # GitHub Actions can receive HTTP 403 from the Gadgets 360 RSS endpoint.
-    # In that case, locate G360 articles through a search engine and then run
-    # the SAME publisher-page verification. This does not weaken the
-    # two-source rule: the final evidence still comes from Gadgets 360.
-    if not g360 and n91:
-        fallback = gadgets360_fallback_candidates(n91, start, end)
-        fallback_verified = {}
-
-        for candidate in fallback:
-            brand = detect_brand(candidate.get("title", ""))
-            if not brand:
-                # Search snippets can omit the brand; the article verifier
-                # checks the publisher page itself, so use the 91mobiles
-                # model's brand when the model was the search target.
-                for item in n91:
-                    if model_key(item["name"]) in model_key(candidate.get("title", "")):
-                        brand = item["brand"]
-                        break
-            if not brand:
-                continue
-
-            verified = verify_publisher_article(
-                candidate, brand, start, end
-            )
-            if not verified:
-                continue
-
-            key = (brand, model_key(verified["name"]))
-            previous = fallback_verified.get(key)
-            if previous is None or verified["article_date"] > previous["article_date"]:
-                fallback_verified[key] = verified
-
-        g360 = list(fallback_verified.values())
 
     print("91mobiles verified launch candidates:", len(n91))
     print("Gadgets 360 verified launch candidates:", len(g360))
