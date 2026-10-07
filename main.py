@@ -274,29 +274,29 @@ def detect_brand(text):
 def normalize_model_name(name, brand=None):
     name = clean(name)
 
-    # News headlines often put the useful model name first and then add
-    # chipset/specification/price text. Keep the model portion only.
     name = re.split(
         r"\b(?:launched|launches|unveiled|debuts|introduced|arrives)\b",
-        name,
-        maxsplit=1,
-        flags=re.I,
+        name, maxsplit=1, flags=re.I,
     )[0]
     name = re.split(
         r"\s+(?:with|featuring|offers|gets|comes)\s+",
-        name,
-        maxsplit=1,
-        flags=re.I,
+        name, maxsplit=1, flags=re.I,
     )[0]
     name = re.sub(r"\s*[:|,-]\s*$", "", name)
     name = re.sub(r"\s+", " ", name).strip(" -:|,")
     name = re.sub(r"^(?:the|new)\s+", "", name, flags=re.I)
 
+    # Strip generic headline suffixes which are not part of the model name.
+    name = re.sub(
+        r"\s+(?:foldable\s+phone|smartphone|mobile\s+phone|mobile|phone)$",
+        "", name, flags=re.I,
+    )
+    name = re.sub(r"\s+(?:5g|4g)$", "", name, flags=re.I)
+
     if brand in {"REDMI", "POCO"}:
         name = re.sub(r"^Xiaomi\s+", "", name, flags=re.I)
 
-    return name
-
+    return name.strip()
 
 def model_key(name):
     low = clean(name).lower()
@@ -712,66 +712,214 @@ def extract_search_result_links(html, allowed_domains):
     return out
 
 
+def _official_model_words(model):
+    return [
+        w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
+        if len(w) >= 2 and w.lower() not in {"the", "phone", "mobile", "smartphone"}
+    ]
+
+
+def _official_url_matches_model(url, model):
+    blob = url.lower().replace("-", " ").replace("_", " ")
+    words = _official_model_words(model)
+    if not words:
+        return False
+    return sum(1 for w in words if w in blob) >= min(2, len(words))
+
+
+def _official_page_matches_model(html, model):
+    soup = BeautifulSoup(html, "html.parser")
+    body = clean(soup.get_text(" ", strip=True)).lower()
+    words = _official_model_words(model)
+    if not words:
+        return False
+    # The first model token plus at least one additional token is enough;
+    # this avoids rejecting official pages whose visible text is JS-rendered.
+    return sum(1 for w in words if w in body) >= min(2, len(words))
+
+
+def _sitemap_locations(domain):
+    roots = [
+        f"https://{domain}/robots.txt",
+        f"https://{domain}/sitemap.xml",
+        f"https://{domain}/sitemap_index.xml",
+        f"https://{domain}/in/sitemap.xml",
+        f"https://{domain}/in/sitemap_index.xml",
+    ]
+    out = []
+    seen = set()
+    for url in roots:
+        if url in seen:
+            continue
+        seen.add(url)
+        html = get_html(url, timeout=20)
+        if not html:
+            continue
+        if url.endswith("robots.txt"):
+            for line in html.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sm = line.split(":", 1)[1].strip()
+                    if sm and sm not in seen:
+                        seen.add(sm)
+                        out.append(sm)
+        else:
+            out.append(url)
+    return out
+
+
+def _sitemap_product_candidates(domain, model, limit=6000):
+    """Find model URLs directly from the official domain's sitemap(s)."""
+    queue = list(_sitemap_locations(domain))
+    seen = set()
+    matches = []
+
+    while queue and len(seen) < limit:
+        sm_url = queue.pop(0)
+        if sm_url in seen:
+            continue
+        seen.add(sm_url)
+
+        xml = get_html(sm_url, timeout=25)
+        if not xml or "<url" not in xml.lower() and "<sitemap" not in xml.lower():
+            continue
+
+        soup = BeautifulSoup(xml, "xml")
+        locs = [clean(x.get_text()) for x in soup.find_all("loc")]
+        if not locs:
+            continue
+
+        is_index = bool(soup.find("sitemapindex")) or "<sitemap" in xml.lower()
+        for loc in locs:
+            if not loc or not same_domain(loc, [domain]):
+                continue
+            if is_index:
+                if loc not in seen and len(queue) + len(seen) < limit:
+                    queue.append(loc)
+            elif _official_url_matches_model(loc, model):
+                matches.append(loc)
+                if len(matches) >= 20:
+                    return matches
+
+    return matches
+
+
 def find_official_product_page(model, brand):
+    """
+    Locate the official India product page without depending on Google/Bing.
+
+    Order:
+      1. Direct sitemap discovery on the official brand domain.
+      2. Direct official-domain product/search links where available.
+      3. Google/Bing only as a last-resort locator.
+
+    Product data is always read from the fetched official page itself.
+    """
     domains = BRANDS[brand]
     candidates = []
 
+    # 1) Try common official India product URL patterns first. This avoids
+    # search-engine dependence and is very fast for brands such as vivo/realme.
+    slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+    direct_paths = {
+        "VIVO": (
+            f"/in/products/param/{slug}",
+            f"/in/products/{slug}",
+        ),
+        "REALME": (
+            f"/in/{slug}",
+            f"/in/{slug}/specs",
+        ),
+        "OPPO": (
+            f"/in/smartphones/series/{slug}/",
+            f"/in/smartphones/{slug}/",
+        ),
+        "ONEPLUS": (
+            f"/in/{slug}",
+            f"/in/phones/{slug}",
+        ),
+        "MOTOROLA": (
+            f"/in/smartphones/{slug}",
+            f"/in/p/{slug}",
+        ),
+        "SAMSUNG": (
+            f"/in/smartphones/{slug}",
+            f"/in/smartphones/galaxy-{slug}",
+        ),
+        "APPLE": (
+            f"/in/{slug}",
+            f"/in/iphone/{slug}",
+        ),
+        "INFINIX": (
+            f"/in/smartphones/{slug}",
+            f"/in/{slug}",
+        ),
+        "POCO": (
+            f"/in/product/{slug}",
+            f"/in/{slug}",
+        ),
+        "REDMI": (
+            f"/in/product/{slug}",
+            f"/in/{slug}",
+        ),
+    }
+    for domain in domains:
+        for path in direct_paths.get(brand, (f"/in/{slug}",)):
+            candidates.append((30, f"https://{domain}{path}"))
+
+    # 2) Direct sitemap discovery is the next locator. It remains independent
+    # of Google/Bing and is validated by fetching the official page itself.
+    for domain in domains:
+        for url in _sitemap_product_candidates(domain, model, limit=1500):
+            score = 20
+            if official_page_is_india(url):
+                score += 8
+            if _official_url_matches_model(url, model):
+                score += 5
+            candidates.append((score, url))
+
+    # 3) Keep the old search-engine locator only as a final fallback.
     for search_url in official_search_urls(model, domains):
-        html = get_html(search_url, timeout=20)
+        html = get_html(search_url, timeout=15)
         if not html:
             continue
-
         for href, text in extract_search_result_links(html, domains):
             blob = (href + " " + text).lower()
-            score = 0
-
+            score = 5
             if official_page_is_india(href):
                 score += 8
             if any(w in blob for w in ("phone", "smartphone", "mobile", "product")):
                 score += 3
-
-            for word in re.findall(r"[a-z0-9]+", model.lower()):
-                if len(word) >= 3 and word in blob:
-                    score += 1
-
-            # Avoid support, manuals, careers, and generic landing pages.
+            if _official_url_matches_model(href, model):
+                score += 5
             if any(x in href.lower() for x in (
-                "/support", "/help", "/careers", "/about",
-                "/privacy", "/terms", "/store-locator",
+                "/support", "/help", "/careers", "/about", "/privacy",
+                "/terms", "/store-locator",
             )):
-                score -= 10
-
+                score -= 15
             candidates.append((score, href))
 
-        if candidates and max(x[0] for x in candidates) >= 8:
-            break
-
-    candidates.sort(reverse=True)
-
+    # Deduplicate while preserving the highest score.
+    ranked = {}
     for score, url in candidates:
+        ranked[url] = max(score, ranked.get(url, -999))
+
+    for url, score in sorted(ranked.items(), key=lambda x: (-x[1], x[0])):
         if score < 5:
             continue
-        html = get_html(url, timeout=30)
+        html = get_html(url, timeout=8)
         if not html:
             continue
 
-        soup = BeautifulSoup(html, "html.parser")
-        body = clean(soup.get_text(" ", strip=True))
-        low = body.lower()
-
-        model_words = [
-            w.lower()
-            for w in re.findall(r"[A-Za-z0-9]+", model)
-            if len(w) >= 3
-        ]
-
-        if model_words and not all(w in low for w in model_words[:2]):
+        if not _official_page_matches_model(html, model):
             continue
 
-        # India confirmation. URL can be global-looking, but page must
-        # contain India when the URL itself doesn't establish India.
-        if not official_page_is_india(url) and "india" not in low:
-            continue
+        # A global-looking URL is acceptable only if the fetched official page
+        # itself establishes India. This preserves the India-only rule.
+        if not official_page_is_india(url):
+            soup = BeautifulSoup(html, "html.parser")
+            low = clean(soup.get_text(" ", strip=True)).lower()
+            if "india" not in low and "inr" not in low and "₹" not in low:
+                continue
 
         return url, html
 
