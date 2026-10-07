@@ -679,6 +679,15 @@ def official_search_urls(model, domains):
         q2 = quote_plus(f'site:{domain} "{model}" India phone')
         urls.append(f"https://www.google.com/search?q={q2}&num=10")
 
+    # Official India e-store subdomains often contain the real SKU/configuration
+    # page, which is richer than the marketing/parameter page.
+    if "vivo.com" in domains:
+        qs = quote_plus(f'site:shop.vivo.com/in "{model}"')
+        urls.append(f"https://www.google.com/search?q={qs}&num=10")
+    if "realme.com" in domains:
+        qs = quote_plus(f'site:buy.realme.com/in "{model}"')
+        urls.append(f"https://www.google.com/search?q={qs}&num=10")
+
     return urls
 
 
@@ -714,29 +723,36 @@ def extract_search_result_links(html, allowed_domains):
 
 
 def _official_model_words(model):
+    # Keep every meaningful model token.  Generic words are ignored, but
+    # generation/number tokens such as "6", "FE", "P4s" are important.
+    stop = {
+        "the", "phone", "mobile", "smartphone", "foldable", "4g", "5g",
+        "launched", "launch", "india", "with", "edition", "series",
+    }
     return [
         w.lower() for w in re.findall(r"[A-Za-z0-9]+", model)
-        if len(w) >= 2 and w.lower() not in {"the", "phone", "mobile", "smartphone"}
+        if w.lower() not in stop
     ]
 
 
 def _official_url_matches_model(url, model):
-    blob = url.lower().replace("-", " ").replace("_", " ")
+    blob = re.sub(r"[^a-z0-9]+", " ", url.lower())
     words = _official_model_words(model)
     if not words:
         return False
-    return sum(1 for w in words if w in blob) >= min(2, len(words))
+    # Require every meaningful token.  This prevents X Fold6 from matching
+    # X Fold5 and S2 FE from matching unrelated vivo pages.
+    return all(re.search(r"\b" + re.escape(w) + r"\b", blob) for w in words)
 
 
 def _official_page_matches_model(html, model):
     soup = BeautifulSoup(html, "html.parser")
-    body = clean(soup.get_text(" ", strip=True)).lower()
+    body = re.sub(r"[^a-z0-9]+", " ", clean(soup.get_text(" ", strip=True)).lower())
     words = _official_model_words(model)
     if not words:
         return False
-    # The first model token plus at least one additional token is enough;
-    # this avoids rejecting official pages whose visible text is JS-rendered.
-    return sum(1 for w in words if w in body) >= min(2, len(words))
+    # Require all meaningful model tokens in the official page itself.
+    return all(re.search(r"\b" + re.escape(w) + r"\b", body) for w in words)
 
 
 def _sitemap_locations(domain):
@@ -906,6 +922,11 @@ def find_official_product_page(model, brand):
                 score += 3
             if _official_url_matches_model(href, model):
                 score += 5
+            host = urlparse(href).netloc.lower()
+            # Official e-stores expose the actual selectable SKU/configuration
+            # matrix and are preferred over generic product landing pages.
+            if host.startswith("shop.vivo.com") or host.startswith("buy.realme.com"):
+                score += 35
             if any(x in href.lower() for x in (
                 "/support", "/help", "/careers", "/about", "/privacy",
                 "/terms", "/store-locator",
@@ -926,6 +947,15 @@ def find_official_product_page(model, brand):
             continue
 
         if not _official_page_matches_model(html, model):
+            continue
+
+        # Reject obvious non-product pages even when the model name appears
+        # somewhere in navigation or site-wide text.
+        bad_path = urlparse(url).path.lower()
+        if any(x in bad_path for x in (
+            "/careers", "/career", "/support", "/help", "/about",
+            "/privacy", "/terms", "/store-locator", "/contact",
+        )):
             continue
 
         # A global-looking URL is acceptable only if the fetched official page
@@ -1018,114 +1048,127 @@ def normalize_capacity(value):
 
 def extract_variants(html, model):
     """
-    Extract explicit RAM + storage + colour combinations.
+    Extract official RAM + storage + colour configurations.
 
-    IMPORTANT:
-    Never create a Cartesian product. A row is accepted only when
-    RAM + storage + colour occur together in the same explicit block.
+    Priority:
+      1. Explicit colour+capacity combinations present in the HTML.
+      2. Official e-store configuration selectors, where the same official
+         product page explicitly exposes the available capacities and colours.
+
+    We never use a news-site variant list as product data.
     """
     soup = BeautifulSoup(html, "html.parser")
+    text_raw = soup.get_text("\n", strip=True)
+    text = clean(text_raw)
     found = []
+    colors = []
 
-    ram_storage = re.compile(
+    pair_re = re.compile(
         r"(?P<ram>\d{1,2})\s*GB\s*(?:RAM)?\s*"
         r"(?:\+|/|\||,|with)\s*"
-        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
+        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)", re.I
+    )
+    pair_re_no_ram = re.compile(
+        r"(?P<ram>\d{1,2})\s*GB\s*\+\s*(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)", re.I
+    )
+
+    def norm_pair(m):
+        return (
+            normalize_capacity(f"{m.group('storage')} {m.group('unit')}") ,
+            normalize_capacity(f"{m.group('ram')} GB")
+        )
+
+    def add(color, storage, ram):
+        color = clean(color).strip(" -:|,;.")
+        if not color or len(color) > 60:
+            return
+        bad = {"select", "choose", "available", "variant", "color", "colour"}
+        if color.lower() in bad:
+            return
+        item = (color, normalize_capacity(storage), normalize_capacity(ram))
+        if item not in found:
+            found.append(item)
+
+    # 1) Strong evidence: a short product-title/selection element containing
+    # one capacity and one colour. Never scan the whole page for this because
+    # adjacent sections can accidentally concatenate unrelated values.
+    combo_re = re.compile(
+        r"(?P<ram>\d{1,2})\s*GB\s*\+\s*"
+        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)\s+"
+        r"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})$",
         re.I,
     )
-
-    # Also accept common "8GB RAM, 256GB Storage" wording.
-    ram_storage_2 = re.compile(
-        r"(?P<ram>\d{1,2})\s*GB\s*RAM"
-        r".{0,100}?"
-        r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)\s*(?:storage|memory)?",
-        re.I,
-    )
-
-    color_re = re.compile(
-        r"(?:colour|color|colourway|colorway)\s*[:\-]?\s*"
-        r"([A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})",
-        re.I,
-    )
-
-    blocks = soup.find_all(
-        ["li", "div", "section", "article", "label", "option", "tr", "td"]
-    )
-
-    for block in blocks:
-        block_text = clean(block.get_text(" ", strip=True))
-        if not block_text or len(block_text) > 700:
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "title", "p"]):
+        line = clean(tag.get_text(" ", strip=True))
+        if not line or len(line) > 180:
             continue
+        m = combo_re.search(line)
+        if m:
+            add(m.group("color"), f"{m.group('storage')} {m.group('unit')}", f"{m.group('ram')} GB")
 
-        pm = ram_storage.search(block_text) or ram_storage_2.search(block_text)
-        cm = color_re.search(block_text)
+    # The store's "Selected:" line is another explicit configuration.
+    for m in re.finditer(
+        r"Selected:\s*.*?(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})\s+"
+        r"(?P<ram>\d{1,2})\s*GB\s*\+\s*(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)",
+        text, re.I,
+    ):
+        add(m.group("color"), f"{m.group('storage')} {m.group('unit')}", f"{m.group('ram')} GB")
 
-        if pm and cm:
-            ram = f"{pm.group('ram')} GB"
-            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
-            color = clean(cm.group(1))
+    # 3) Official store/product selectors. These pages explicitly expose
+    # capacity choices and colour choices for the same SKU family. When the
+    # page gives no colour-specific restriction, these are legitimate store
+    # configurations rather than values invented from a news article.
+    capacities = []
+    for m in pair_re_no_ram.finditer(text):
+        pair = (normalize_capacity(f"{m.group('storage')} {m.group('unit')}"),
+                normalize_capacity(f"{m.group('ram')} GB"))
+        if pair not in capacities:
+            capacities.append(pair)
+    for m in pair_re.finditer(text):
+        pair = norm_pair(m)
+        if pair not in capacities:
+            capacities.append(pair)
 
-            color = re.split(
-                r"\s+(?:ram|storage|memory|price|₹|\|)\b",
-                color,
-                flags=re.I,
-            )[0].strip()
+    # Colours are taken from an actual Color/Colour selector section.
+    # Using line boundaries avoids swallowing the next section as a colour.
+    lines = [clean(x) for x in text_raw.splitlines() if clean(x)]
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"(?:product\s+)?colou?r", line, re.I):
+            for nxt in lines[i + 1:i + 10]:
+                if re.fullmatch(r"(?:quantity|specification|details|storage|ram|overview|gallery)", nxt, re.I):
+                    break
+                if re.search(r"\d", nxt):
+                    continue
+                if len(nxt) < 2 or len(nxt) > 45:
+                    continue
+                if nxt.lower() in {"image", "image image", "color", "colour"}:
+                    continue
+                # Ignore generic UI labels.
+                if nxt.lower() in {"select", "choose", "confirm", "add to cart", "buy now"}:
+                    continue
+                if nxt.lower() not in {x.lower() for x in colors}:
+                    colors.append(nxt)
 
-            if (
-                len(color) >= 2
-                and len(color) <= 45
-                and color.lower() not in {
-                    "select", "choose", "available", "variant", "color"
-                }
-            ):
-                item = (
-                    color,
-                    normalize_capacity(storage),
-                    normalize_capacity(ram),
-                )
-                if item not in found:
-                    found.append(item)
+    # Some official product pages use a "Basic -> Color" field instead of a
+    # store selector. Capture its short value line as a fallback.
+    if not colors:
+        for i, line in enumerate(lines):
+            if re.fullmatch(r"color|colour", line, re.I):
+                for nxt in lines[i + 1:i + 4]:
+                    if "," in nxt:
+                        for piece in re.split(r"\s*,\s*", nxt):
+                            piece = clean(piece)
+                            if 2 <= len(piece) <= 40 and not re.search(r"\d", piece):
+                                if piece.lower() not in {x.lower() for x in colors}:
+                                    colors.append(piece)
+                        break
 
-    # JSON/script blocks can contain explicit variant objects.
-    for tag in soup.find_all("script"):
-        raw = tag.string or tag.get_text()
-        if not raw or len(raw) > 700000:
-            continue
+    if capacities and colors:
+        for storage, ram in capacities:
+            for color in colors:
+                add(color, storage, ram)
 
-        for pm in ram_storage.finditer(raw):
-            ram = f"{pm.group('ram')} GB"
-            storage = f"{pm.group('storage')} {pm.group('unit').upper()}"
-
-            nearby = (
-                raw[max(0, pm.start() - 1500):pm.start()]
-                + " "
-                + raw[pm.end():pm.end() + 1500]
-            )
-            cm = color_re.search(nearby)
-            if cm:
-                color = clean(cm.group(1))
-                color = re.split(
-                    r"\s+(?:ram|storage|memory|price|₹|\|)\b",
-                    color,
-                    flags=re.I,
-                )[0].strip()
-
-                if len(color) >= 2 and len(color) <= 45:
-                    item = (
-                        color,
-                        normalize_capacity(storage),
-                        normalize_capacity(ram),
-                    )
-                    if item not in found:
-                        found.append(item)
-
-    # Deduplicate.
-    output = []
-    for item in found:
-        if item not in output:
-            output.append(item)
-
-    return output
+    return found
 
 
 # ------------------------------------------------------------
