@@ -898,53 +898,86 @@ def discover_source_candidates(source, start, end, test_mode):
     return list(out.values())
 
 
-def gadgets360_fallback_candidates(n91_candidates, start, end):
-    """
-    Locate G360 articles through Jina Search when GitHub cannot access
-    Gadgets 360 directly. Every URL is still fetched from Gadgets 360 and
-    independently verified before it can qualify.
-    """
-    found = []
-    seen = set()
+def resolve_url(url, timeout=20):
+    """Resolve a locator URL and return its final URL."""
+    if not url:
+        return ""
+    try:
+        response = SESSION.get(url, timeout=timeout, allow_redirects=True,
+                               headers={"User-Agent": USER_AGENT})
+        return normalize_url(response.url) if response.url else ""
+    except requests.RequestException:
+        return ""
 
+
+def google_news_gadgets360_candidates(model, brand, start, end):
+    """Use Google News RSS only as a locator for a Gadgets 360 article."""
+    query = f'site:gadgets360.com/mobiles/news "{model}" "launched in India"'
+    rss_url = ("https://news.google.com/rss/search?q=" + quote_plus(query)
+               + "&hl=en-IN&gl=IN&ceid=IN:en")
+    try:
+        response = SESSION.get(rss_url, timeout=30,
+                               headers={"User-Agent": USER_AGENT,
+                                        "Accept": "application/rss+xml,application/xml,text/xml"})
+        if not response.ok or len(response.text) < 100:
+            return []
+        root = ET.fromstring(response.text)
+    except (requests.RequestException, ET.ParseError):
+        return []
+
+    found, seen = [], set()
+    for item in root.findall(".//item"):
+        title = clean(item.findtext("title"))
+        link = clean(item.findtext("link"))
+        source_el = item.find("source")
+        publisher = clean(source_el.text if source_el is not None else "")
+        published = parse_rss_date(clean(item.findtext("pubDate")))
+        if not link or publisher.lower() != "gadgets 360":
+            continue
+        if published and not (start - timedelta(days=2) <= published <= end + timedelta(days=2)):
+            continue
+        final_url = resolve_url(link)
+        parsed = urlparse(final_url)
+        if "gadgets360.com" not in parsed.netloc.lower() or not parsed.path.lower().startswith("/mobiles/news/"):
+            continue
+        if final_url in seen:
+            continue
+        seen.add(final_url)
+        found.append({"title": title, "url": final_url, "published": published, "source": "gadgets360"})
+    return found
+
+
+def gadgets360_fallback_candidates(n91_candidates, start, end):
+    """Locate G360 articles when its RSS/site is blocked; search is locator-only."""
+    found, seen = [], set()
     for item in n91_candidates:
         model = item.get("name", "").strip()
         brand = item.get("brand", "").strip()
         if not model or not brand:
             continue
 
-        queries = [
+        # Primary recovery: Google News RSS, restricted to publisher Gadgets 360.
+        for candidate in google_news_gadgets360_candidates(model, brand, start, end):
+            if candidate["url"] not in seen:
+                seen.add(candidate["url"]); found.append(candidate)
+
+        # Secondary locator: Jina Search.
+        for query_text in (
             f'site:gadgets360.com/mobiles/news "{model}" "launched in India"',
             f'site:gadgets360.com/mobiles/news "{brand}" "{model}"',
-        ]
-
-        for query_text in queries:
-            results = jina_search(query_text)
-            for result in results:
+        ):
+            for result in jina_search(query_text):
                 href = normalize_url(result.get("url", ""))
-                if not href or href in seen:
-                    continue
-
                 parsed = urlparse(href)
-                if "gadgets360.com" not in parsed.netloc.lower():
+                if (not href or "gadgets360.com" not in parsed.netloc.lower()
+                        or not parsed.path.lower().startswith("/mobiles/news/")
+                        or href in seen):
                     continue
-                if not parsed.path.lower().startswith("/mobiles/news/"):
-                    continue
-
                 seen.add(href)
-                found.append({
-                    "title": clean(result.get("title", "")),
-                    "url": href,
-                    "published": result.get("published"),
-                    "source": "gadgets360",
-                })
-
-            # One successful query is enough for this model; the article
-            # verifier below will decide whether any result is real evidence.
-            if any(x.get("url") for x in found if x.get("url")):
-                pass
-
-    print("Gadgets 360 Jina search article candidates:", len(found))
+                found.append({"title": clean(result.get("title", "")),
+                              "url": href, "published": result.get("published"),
+                              "source": "gadgets360"})
+    print("Gadgets 360 recovery article candidates:", len(found))
     return found
 
 
