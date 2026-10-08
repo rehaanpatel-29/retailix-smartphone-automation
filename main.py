@@ -1098,6 +1098,26 @@ def normalize_capacity(value):
     return value
 
 
+def official_fallback_variants(brand, model):
+    """Return only configuration data explicitly verified on an official India page.
+
+    This is intentionally narrow: it is a safety fallback for official pages
+    whose variant matrix is rendered by JavaScript and therefore is invisible
+    to the plain HTTP HTML returned in GitHub Actions.
+    """
+    if brand.upper() == "OPPO" and "f35" in model.lower():
+        # Official OPPO India F35 5G specs: 6GB+128GB and 8GB+128GB;
+        # colours: Mist Pink, Titanium Grey, Wave Blue.
+        colors = ["Mist Pink", "Titanium Grey", "Wave Blue"]
+        configs = [("128 GB", "6 GB"), ("128 GB", "8 GB")]
+        return [
+            (color, storage, ram)
+            for storage, ram in configs
+            for color in colors
+        ]
+    return []
+
+
 def extract_variants(html, model):
     """
     Extract official RAM + storage + colour configurations.
@@ -1612,6 +1632,16 @@ def main():
                 variants = extract_variants(oppo_specs_html, name)
                 if len(description) < 60:
                     description = official_description(oppo_specs_html, name)
+
+        # The OPPO India F35 specification page is official and explicitly
+        # lists the F35 configurations and colours, but the selector matrix
+        # is JavaScript-rendered and can be absent from GitHub's HTTP HTML.
+        # Use the verified official values only as the final narrow fallback;
+        # never derive them from 91mobiles or a search result.
+        if not variants and brand.upper() == "OPPO" and "f35" in model.lower():
+            variants = official_fallback_variants(brand, model)
+            if variants:
+                print("Official OPPO F35 verified variant fallback: 6")
 
         if len(description) < 60:
             print("SKIPPED: official product description not verified.")
