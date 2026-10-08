@@ -1150,10 +1150,26 @@ def extract_variants(html, model):
         low = value.lower()
         if low in NON_COLOR_LABELS:
             return False
-        return not any(term in low for term in (
+
+        # Reject navigation, footer, and promotional UI text that can appear
+        # beside the official colour selector on JS-rendered brand pages.
+        # These strings are not product colours even though they may be
+        # captured by generic `color` / `colour` JSON fields.
+        NON_COLOR_UI_TERMS = (
+            "oppo", "samsung", "vivo", "realme", "oneplus", "motorola",
+            "apple", "infinix", "redmi", "poco",
             "operating system", "resolution", "display", "storage",
             "specification", "quantity", "select color", "choose color",
-        ))
+            "apex guard", "newsroom", "campaign", "support", "student",
+            "offer", "download", "store", "career", "careers",
+            "privacy", "terms", "contact", "about", "warranty",
+            "add to cart", "buy now", "learn more", "my oppo",
+            "os ",
+        )
+        if any(term in low for term in NON_COLOR_UI_TERMS):
+            return False
+
+        return True
 
     def add(color, storage, ram):
         color = clean(color).strip(" -:|,;.")
