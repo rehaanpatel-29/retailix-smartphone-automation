@@ -1024,14 +1024,37 @@ def find_official_product_page(model, brand):
 # OFFICIAL PRODUCT DATA
 # ------------------------------------------------------------
 
-def product_name_from_official(html, fallback):
-    soup = BeautifulSoup(html, "html.parser")
+def clean_product_name(value):
+    """Return only the base phone/model name; never include a SKU variant."""
+    value = clean(value)
+    if not value:
+        return ""
 
-    tag = soup.find("h1")
-    if tag:
-        value = clean(tag.get_text(" ", strip=True))
-        if 2 <= len(value) <= 120:
-            return value
+    # Remove common RAM/storage configuration suffixes.  Keep model tokens
+    # such as 5G, FE, Pro, Ultra, etc. because they can be part of the name.
+    value = re.sub(
+        r"\s*[-|]\s*\d{1,2}\s*GB\s*\+\s*\d{2,4}\s*(?:GB|TB)\b.*$",
+        "", value, flags=re.I,
+    )
+    value = re.sub(
+        r"\s*\(\s*\d{1,2}\s*GB(?:\s+(?:RAM|Memory))?\s*\)\s*$",
+        "", value, flags=re.I,
+    )
+    value = re.sub(
+        r"\s*\d{1,2}\s*GB\s*\+\s*\d{2,4}\s*(?:GB|TB)\b.*$",
+        "", value, flags=re.I,
+    )
+    value = re.sub(r"\s+[-|]\s*(?:Official|Buy|India)\b.*$", "", value, flags=re.I)
+    return clean(value).strip("-| ")
+
+
+def product_name_from_official(html, fallback):
+    # The 91mobiles launch model is the safest base name.  Official e-store
+    # headings often include the currently selected RAM/storage/colour, so
+    # they must not be copied directly into productName.
+    fallback_name = clean_product_name(fallback)
+
+    soup = BeautifulSoup(html, "html.parser")
 
     for attrs in (
         {"property": "og:title"},
@@ -1039,17 +1062,17 @@ def product_name_from_official(html, fallback):
     ):
         m = soup.find("meta", attrs=attrs)
         if m and m.get("content"):
-            value = clean(m["content"])
-            value = re.sub(
-                r"\s*[-|]\s*(Official.*|Buy.*|India.*)$",
-                "",
-                value,
-                flags=re.I,
-            )
-            if len(value) >= 2:
-                return value
+            value = clean_product_name(m["content"])
+            if value and fallback_name:
+                # Prefer the discovery model when the official title contains
+                # variant information.  Use the official title only when it
+                # still looks like the same base model.
+                compact_value = re.sub(r"[^a-z0-9]+", "", value.lower())
+                compact_fallback = re.sub(r"[^a-z0-9]+", "", fallback_name.lower())
+                if compact_fallback in compact_value or compact_value in compact_fallback:
+                    return value
 
-    return clean(fallback)
+    return fallback_name
 
 
 def official_description(html, model):
@@ -1127,16 +1150,50 @@ def extract_variants(html, model):
             normalize_capacity(f"{m.group('ram')} GB")
         )
 
+    NON_COLOR_LABELS = {
+        "select", "choose", "available", "variant", "color", "colour",
+        "operating system", "display", "size", "resolution", "type",
+        "quantity", "specification", "specifications", "details",
+        "storage", "ram", "overview", "gallery", "image", "image image",
+        "memory", "processor", "camera", "battery", "dimensions",
+        "weight", "network", "connectivity", "sim", "warranty",
+    }
+
+    def valid_color_candidate(value):
+        value = clean(value).strip(" -:|,;.")
+        if not value or len(value) > 45 or re.search(r"\d", value):
+            return False
+        low = value.lower()
+        if low in NON_COLOR_LABELS:
+            return False
+        return not any(term in low for term in (
+            "operating system", "resolution", "display", "storage",
+            "specification", "quantity", "select color", "choose color",
+        ))
+
     def add(color, storage, ram):
         color = clean(color).strip(" -:|,;.")
         if not color or len(color) > 60:
             return
-        bad = {"select", "choose", "available", "variant", "color", "colour"}
-        if color.lower() in bad:
-            return
-        item = (color, normalize_capacity(storage), normalize_capacity(ram))
-        if item not in found:
-            found.append(item)
+
+        # A colour field sometimes arrives as one pipe-separated selector
+        # value. Split it into individual colours instead of storing the whole
+        # selector as one colour.
+        pieces = [clean(x) for x in re.split(r"\s*[|]\s*", color) if clean(x)]
+        for piece in pieces:
+            low = piece.lower()
+            if low in NON_COLOR_LABELS:
+                continue
+            if re.search(r"\d", piece):
+                continue
+            if any(term in low for term in (
+                "operating system", "resolution", "display", "storage",
+                "specification", "quantity", "select color", "choose color",
+            )):
+                continue
+            item = (piece, normalize_capacity(storage), normalize_capacity(ram))
+            if item not in found:
+                found.append(item)
 
     # 1) Strong evidence: a short product-title/selection element containing
     # one capacity and one colour. Never scan the whole page for this because
@@ -1168,15 +1225,26 @@ def extract_variants(html, model):
     # page gives no colour-specific restriction, these are legitimate store
     # configurations rather than values invented from a news article.
     capacities = []
+    # Smartphone RAM values are constrained to realistic standard capacities.
+    # This prevents values such as "28 GB" from being misread from unrelated
+    # specification text on an e-store page.
+    valid_ram_gb = {2, 3, 4, 6, 8, 12, 16, 18, 24, 32}
+
+    def add_capacity(pair):
+        storage, ram = pair
+        ram_num = int(re.search(r"\d+", ram).group())
+        if ram_num not in valid_ram_gb:
+            return
+        if pair not in capacities:
+            capacities.append(pair)
+
     for m in pair_re_no_ram.finditer(text):
-        pair = (normalize_capacity(f"{m.group('storage')} {m.group('unit')}"),
-                normalize_capacity(f"{m.group('ram')} GB"))
-        if pair not in capacities:
-            capacities.append(pair)
+        add_capacity((
+            normalize_capacity(f"{m.group('storage')} {m.group('unit')}"),
+            normalize_capacity(f"{m.group('ram')} GB")
+        ))
     for m in pair_re.finditer(text):
-        pair = norm_pair(m)
-        if pair not in capacities:
-            capacities.append(pair)
+        add_capacity(norm_pair(m))
 
     # Colours are taken from an actual Color/Colour selector section.
     # Using line boundaries avoids swallowing the next section as a colour.
@@ -1190,13 +1258,14 @@ def extract_variants(html, model):
                     continue
                 if len(nxt) < 2 or len(nxt) > 45:
                     continue
-                if nxt.lower() in {"image", "image image", "color", "colour"}:
+                if not valid_color_candidate(nxt):
                     continue
-                # Ignore generic UI labels.
-                if nxt.lower() in {"select", "choose", "confirm", "add to cart", "buy now"}:
-                    continue
-                if nxt.lower() not in {x.lower() for x in colors}:
-                    colors.append(nxt)
+                # A pipe-separated selector is one UI value containing several
+                # actual colours; keep each colour separately.
+                for piece in re.split(r"\s*[|]\s*", nxt):
+                    piece = clean(piece)
+                    if valid_color_candidate(piece) and piece.lower() not in {x.lower() for x in colors}:
+                        colors.append(piece)
 
     # Some official product pages use a "Basic -> Color" field instead of a
     # store selector. Capture its short value line as a fallback.
@@ -1207,9 +1276,8 @@ def extract_variants(html, model):
                     if "," in nxt:
                         for piece in re.split(r"\s*,\s*", nxt):
                             piece = clean(piece)
-                            if 2 <= len(piece) <= 40 and not re.search(r"\d", piece):
-                                if piece.lower() not in {x.lower() for x in colors}:
-                                    colors.append(piece)
+                            if valid_color_candidate(piece) and piece.lower() not in {x.lower() for x in colors}:
+                                colors.append(piece)
                         break
 
     # 4) JSON/embedded-store fallback. E-commerce pages frequently keep the
@@ -1226,12 +1294,9 @@ def extract_variants(html, model):
         for m in pair_re_no_ram.finditer(combined):
             pair = (normalize_capacity(f"{m.group('storage')} {m.group('unit')}"),
                     normalize_capacity(f"{m.group('ram')} GB"))
-            if pair not in capacities:
-                capacities.append(pair)
+            add_capacity(pair)
         for m in pair_re.finditer(combined):
-            pair = norm_pair(m)
-            if pair not in capacities:
-                capacities.append(pair)
+            add_capacity(norm_pair(m))
 
     # JSON fields such as color/colorName/colourName are high-confidence
     # selector values.
@@ -1240,9 +1305,10 @@ def extract_variants(html, model):
         script_blob, re.I,
     ):
         value = clean(m.group(1))
-        if value and not re.search(r"\b(?:select|choose|color|colour)\b", value, re.I):
-            if value.lower() not in {x.lower() for x in colors}:
-                colors.append(value)
+        for piece in re.split(r"\s*[|]\s*", value):
+            piece = clean(piece)
+            if valid_color_candidate(piece) and piece.lower() not in {x.lower() for x in colors}:
+                colors.append(piece)
 
     # A compact visible selector may contain several colour names between the
     # Colour label and the next selector heading. Capture the bounded segment
@@ -1263,9 +1329,8 @@ def extract_variants(html, model):
             )
             for value in candidates2:
                 value = clean(value)
-                if 2 <= len(value) <= 45 and not re.search(r"\d|\b(?:Color|Colour|Quantity|Storage|Specification)\b", value, re.I):
-                    if value.lower() not in {x.lower() for x in colors}:
-                        colors.append(value)
+                if valid_color_candidate(value) and value.lower() not in {x.lower() for x in colors}:
+                    colors.append(value)
 
     if capacities and colors:
         for storage, ram in capacities:
