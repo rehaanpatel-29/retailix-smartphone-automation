@@ -148,8 +148,56 @@ def _render_page_with_browser(url, timeout=30):
                 locale="en-IN",
             )
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            page.wait_for_timeout(2500)
-            return page.content()
+
+            # JS commerce pages often render the product shell first and the
+            # actual selector data several seconds later. Do not treat
+            # DOMContentLoaded as proof that product data is ready.
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 15000))
+            except Exception:
+                pass
+
+            # Trigger lazy-loaded product sections. This is generic and does
+            # not click any purchase/checkout controls.
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.55)")
+                page.wait_for_timeout(1500)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.85)")
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            # Wait for useful product-selector text when a commerce page
+            # exposes it. If the selector wording differs, the timeout simply
+            # expires and we still return the rendered DOM.
+            try:
+                page.wait_for_function(
+                    r"""() => {
+                        const t = (document.body && document.body.innerText || '').toLowerCase();
+                        const hasMemory = /\b\d{1,2}\s*gb\s*\+\s*\d{2,4}\s*(gb|tb)\b/i.test(t);
+                        const hasSelector = /\b(color|colour|storage|memory|ram)\b/i.test(t);
+                        return t.length > 1000 && hasMemory && hasSelector;
+                    }""",
+                    timeout=min(timeout * 1000, 10000),
+                )
+            except Exception:
+                pass
+
+            rendered = page.content()
+
+            # Preserve the rendered human-visible text explicitly. Some JS
+            # stores place selector values in client-side shadow/application
+            # state where BeautifulSoup sees only the shell markup. Appending
+            # body.innerText gives the normal parser the exact text a user sees
+            # without inventing any product data.
+            try:
+                visible_text = page.locator("body").inner_text(timeout=5000)
+                if visible_text and len(visible_text) > 300:
+                    rendered += "\n<!-- RETAILIX_RENDERED_VISIBLE_TEXT -->\n<pre>" + visible_text + "</pre>"
+            except Exception:
+                pass
+
+            return rendered
     except Exception as exc:
         print(f"Browser render unavailable for {url}: {exc}")
         return ""
@@ -173,7 +221,11 @@ def get_html(url, timeout=30):
 
     if html and _looks_like_js_commerce_page(url, html):
         rendered = _render_page_with_browser(url, timeout=timeout)
-        if rendered and len(rendered) > len(html):
+        # A rendered DOM can legitimately be smaller than the original
+        # JavaScript application shell. Length is not evidence that the
+        # rendered page is worse. For known JS-heavy commerce stores, prefer
+        # the rendered DOM whenever it is non-empty.
+        if rendered and len(rendered) > 300:
             print(f"Rendered official JS page: {url}")
             return rendered
 
@@ -1626,18 +1678,36 @@ def extract_variants(html, model):
             text_raw, re.I | re.S,
         )
         if m:
-            segment = clean(m.group(1))
-            segment = re.sub(r"\b(?:select|choose|confirm|add to cart|buy now)\b", "", segment, flags=re.I)
-            # Prefer multi-word title-case runs, then individual title-case
-            # words; avoid UI fragments and currency/numeric values.
-            candidates2 = re.findall(
-                r"\b[A-Z][A-Za-z0-9&'’./-]*(?:\s+[A-Z][A-Za-z0-9&'’./-]*){0,3}\b",
-                segment,
-            )
-            for value in candidates2:
-                value = clean(value)
-                if valid_color_candidate(value) and value.lower() not in {x.lower() for x in colors}:
-                    colors.append(value)
+            raw_segment = m.group(1)
+            # Preserve line boundaries from rendered product selectors. A
+            # common JS-store layout is:
+            #   Color
+            #   Moonlight Silver
+            #   Nebula Black
+            #   Storage
+            # Collapsing whitespace first would incorrectly turn the two
+            # colours into one four-word colour name.
+            lines = [
+                clean(x) for x in re.split(r"\n|<br\s*/?>", raw_segment, flags=re.I)
+                if clean(x)
+            ]
+            for line in lines:
+                line = re.sub(r"\b(?:select|choose|confirm|add to cart|buy now)\b", "", line, flags=re.I)
+                line = clean(line)
+                if valid_color_candidate(line) and line.lower() not in {x.lower() for x in colors}:
+                    colors.append(line)
+
+            # Fallback for stores that flatten selector choices onto one line.
+            if not colors:
+                segment = clean(raw_segment)
+                candidates2 = re.findall(
+                    r"\b[A-Z][A-Za-z0-9&'’./-]*(?:\s+[A-Z][A-Za-z0-9&'’./-]*){0,3}\b",
+                    segment,
+                )
+                for value in candidates2:
+                    value = clean(value)
+                    if valid_color_candidate(value) and value.lower() not in {x.lower() for x in colors}:
+                        colors.append(value)
 
     if capacities and colors:
         for storage, ram in capacities:
