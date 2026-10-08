@@ -1049,31 +1049,11 @@ def clean_product_name(value):
 
 
 def product_name_from_official(html, fallback):
-    # The 91mobiles launch model is the safest base name.  Official e-store
-    # headings often include the currently selected RAM/storage/colour, so
-    # they must not be copied directly into productName.
-    fallback_name = clean_product_name(fallback)
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    for attrs in (
-        {"property": "og:title"},
-        {"name": "twitter:title"},
-    ):
-        m = soup.find("meta", attrs=attrs)
-        if m and m.get("content"):
-            value = clean_product_name(m["content"])
-            if value and fallback_name:
-                # Prefer the discovery model when the official title contains
-                # variant information.  Use the official title only when it
-                # still looks like the same base model.
-                compact_value = re.sub(r"[^a-z0-9]+", "", value.lower())
-                compact_fallback = re.sub(r"[^a-z0-9]+", "", fallback_name.lower())
-                if compact_fallback in compact_value or compact_value in compact_fallback:
-                    return value
-
-    return fallback_name
-
+    # productName must contain ONLY the model name. Do not derive it from
+    # official e-store titles because those titles commonly contain selected
+    # RAM, storage, colour, price, or SKU information.
+    # The 91mobiles launch model is the canonical product-name source.
+    return clean_product_name(fallback)
 
 def official_description(html, model):
     soup = BeautifulSoup(html, "html.parser")
