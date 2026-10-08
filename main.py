@@ -1248,6 +1248,29 @@ def extract_variants(html, model):
     # capacity choices and colour choices for the same SKU family. When the
     # page gives no colour-specific restriction, these are legitimate store
     # configurations rather than values invented from a news article.
+    # Some official stores put the currently selected SKU directly in the
+    # product name, for example:
+    #   Product Name-realme P4s Lite (Moonlight Silver,4GB+64GB)
+    # This is explicit SKU evidence and should be captured generically for any
+    # brand/store using the same product-name pattern.
+    selected_product_patterns = (
+        re.compile(
+            r"\((?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})\s*,\s*"
+            r"(?P<ram>\d{1,2})\s*GB\s*\+\s*"
+            r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)\)", re.I
+        ),
+        re.compile(
+            r"(?P<color>[A-Za-z][A-Za-z0-9 &'’()./\-]{2,45})\s*[-|]\s*"
+            r"(?P<ram>\d{1,2})\s*GB\s*\+\s*"
+            r"(?P<storage>\d{2,4})\s*(?P<unit>GB|TB)\b", re.I
+        ),
+    )
+    for pattern in selected_product_patterns:
+        for m in pattern.finditer(text_raw):
+            color = clean(m.group("color"))
+            if valid_color_candidate(color):
+                add(color, f"{m.group('storage')} {m.group('unit')}", f"{m.group('ram')} GB")
+
     capacities = []
     # Smartphone RAM values are constrained to realistic standard capacities.
     # This prevents values such as "28 GB" from being misread from unrelated
@@ -1492,11 +1515,12 @@ def extract_variants(html, model):
                         add(color, storage, ram)
             start = idx + len(marker)
 
-    # If we found real SKU relationships, return them immediately. Do NOT
-    # continue to the generic capacity x colour Cartesian product below.
-    # Structured SKU evidence is stronger and prevents false combinations.
-    if found:
-        return found
+    # Do not return a single structured SKU immediately. Many official stores
+    # expose only the currently selected SKU as a structured object while the
+    # same page separately exposes the complete Color and Storage selectors.
+    # The selected SKU is still valuable evidence, but it must not hide the
+    # other officially listed selector values. We merge the structured evidence
+    # with the official selector evidence below.
 
     # 4) JSON/embedded-store fallback. E-commerce pages frequently keep the
     # selector data in script/JSON rather than visible text. Read only explicit
