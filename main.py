@@ -1270,6 +1270,24 @@ def extract_variants(html, model):
                     if valid_color_candidate(piece) and piece.lower() not in {x.lower() for x in colors}:
                         colors.append(piece)
 
+    # Some official specification pages publish the available product
+    # colours as one pipe-separated line, e.g.
+    # "Mist Pink | Titanium Grey | Wave Blue". This is common on OPPO's
+    # official India specification pages. Only accept a short line made
+    # entirely of valid colour candidates; never scan arbitrary page text.
+    if not colors:
+        for line in lines[:40]:
+            if "|" not in line:
+                continue
+            pieces = [clean(x) for x in re.split(r"\s*[|]\s*", line) if clean(x)]
+            if not (2 <= len(pieces) <= 5):
+                continue
+            if all(valid_color_candidate(piece) for piece in pieces):
+                for piece in pieces:
+                    if piece.lower() not in {x.lower() for x in colors}:
+                        colors.append(piece)
+                break
+
     # Some official product pages use a "Basic -> Color" field instead of a
     # store selector. Capture its short value line as a fallback.
     if not colors:
@@ -1580,6 +1598,20 @@ def main():
         name = product_name_from_official(official_html, model)
         description = official_description(official_html, name)
         variants = extract_variants(official_html, name)
+
+        # Some official OPPO product landing pages expose the marketing
+        # content but do not expose the complete RAM/ROM selector data in the
+        # HTML returned to GitHub Actions. For OPPO F35 series, use the
+        # official India specifications page as a second official source for
+        # the same product family. This is NOT a news-site fallback.
+        if not variants and brand.upper() == "OPPO" and "f35" in model.lower():
+            oppo_specs_url = "https://www.oppo.com/in/smartphones/series-f/f35-5g/specs/"
+            oppo_specs_html = get_html(oppo_specs_url, timeout=30)
+            if oppo_specs_html:
+                print("Official OPPO specs fallback:", oppo_specs_url)
+                variants = extract_variants(oppo_specs_html, name)
+                if len(description) < 60:
+                    description = official_description(oppo_specs_html, name)
 
         if len(description) < 60:
             print("SKIPPED: official product description not verified.")
