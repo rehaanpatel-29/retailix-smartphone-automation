@@ -1143,6 +1143,10 @@ def extract_variants(html, model):
         value = clean(value).strip(" -:|,;.")
         if not value or len(value) > 45 or re.search(r"\d", value):
             return False
+        # Reject CSS/HTML hex colour codes such as #fff and #ffffff.
+        # These are styling values, not product colour names.
+        if re.fullmatch(r"#[0-9a-f]{3,8}", value, re.I):
+            return False
         low = value.lower()
         if low in NON_COLOR_LABELS:
             return False
@@ -1163,6 +1167,9 @@ def extract_variants(html, model):
         for piece in pieces:
             low = piece.lower()
             if low in NON_COLOR_LABELS:
+                continue
+            # Never store CSS/HTML hex values as product colours.
+            if re.fullmatch(r"#[0-9a-f]{3,8}", piece, re.I):
                 continue
             if re.search(r"\d", piece):
                 continue
