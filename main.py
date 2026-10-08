@@ -107,15 +107,80 @@ def same_domain(url, domains):
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
+PLAYWRIGHT_AVAILABLE = False
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    sync_playwright = None
+
+
+def _looks_like_js_commerce_page(url, html):
+    host = urlparse(url).netloc.lower()
+    if host.startswith(("buy.realme.com", "shop.vivo.com")):
+        return True
+    low = (html or "").lower()
+    shell_markers = (
+        "__next_data__", "__nuxt__", "id=\"app\"",
+        "id=\"root\"", "webpack", "vite", "reactroot",
+    )
+    return len(low) < 12000 and sum(marker in low for marker in shell_markers) >= 2
+
+
+def _render_page_with_browser(url, timeout=30):
+    if not PLAYWRIGHT_AVAILABLE:
+        return ""
+    browser = None
+    try:
+        with sync_playwright() as pw:
+            chrome = (
+                shutil.which("google-chrome")
+                or shutil.which("google-chrome-stable")
+                or shutil.which("chromium")
+                or shutil.which("chromium-browser")
+            )
+            launch_args = {"headless": True}
+            if chrome:
+                launch_args["executable_path"] = chrome
+            browser = pw.chromium.launch(**launch_args)
+            page = browser.new_page(
+                user_agent=SESSION.headers["User-Agent"],
+                locale="en-IN",
+            )
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            page.wait_for_timeout(2500)
+            return page.content()
+    except Exception as exc:
+        print(f"Browser render unavailable for {url}: {exc}")
+        return ""
+    finally:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+
+
 def get_html(url, timeout=30):
-    """Fetch a page directly from the requested source."""
+    """Fetch a page directly; render JS-heavy official commerce pages when needed."""
+    html = ""
     try:
         r = SESSION.get(url, timeout=timeout, allow_redirects=True)
         if r.ok and len(r.text) > 300:
-            return r.text
+            html = r.text
     except requests.RequestException:
         pass
-    return ""
+
+    if html and _looks_like_js_commerce_page(url, html):
+        rendered = _render_page_with_browser(url, timeout=timeout)
+        if rendered and len(rendered) > len(html):
+            print(f"Rendered official JS page: {url}")
+            return rendered
+
+    if html:
+        return html
+
+    return _render_page_with_browser(url, timeout=timeout)
 
 
 # ------------------------------------------------------------
