@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import re
+import json
 import shutil
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, quote_plus
@@ -1320,6 +1321,182 @@ def extract_variants(html, model):
                             if valid_color_candidate(piece) and piece.lower() not in {x.lower() for x in colors}:
                                 colors.append(piece)
                         break
+
+    script_blob = "\n".join(
+        (tag.string or tag.get_text(" ", strip=True))
+        for tag in soup.find_all("script")
+        if (tag.string or tag.get_text(" ", strip=True))
+    )
+
+    # 4) Structured SKU/variant fallback.
+    #
+    # Many modern official stores (including React/Next.js commerce sites)
+    # render the visible selector from a JSON object embedded in <script>
+    # tags. The generic text parser above can see the available colours and
+    # capacities, but it cannot safely know which colour belongs to which
+    # capacity. Before falling back to a Cartesian product, inspect embedded
+    # structured data for an object that represents ONE purchasable SKU/
+    # variant. This keeps the colour <-> RAM <-> storage relationship intact
+    # and works across future phones/brands instead of hard-coding a model.
+    def _norm_field_name(value):
+        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+    def _variant_color_value(obj):
+        if not isinstance(obj, dict):
+            return ""
+        color_keys = {
+            "color", "colour", "colorname", "colourname",
+            "variantcolor", "variantcolour", "colorvalue",
+            "colourvalue", "optioncolor", "optioncolour",
+        }
+        for key, value in obj.items():
+            nk = _norm_field_name(key)
+            if nk in color_keys and isinstance(value, (str, int, float)):
+                value = clean(str(value))
+                if valid_color_candidate(value):
+                    return value
+        return ""
+
+    def _variant_pair_value(obj):
+        if not isinstance(obj, dict):
+            return None
+
+        # Direct combined configuration fields, e.g. 4GB+64GB.
+        for key, value in obj.items():
+            nk = _norm_field_name(key)
+            if nk in {
+                "configuration", "config", "variant", "variantname",
+                "optionname", "skuvariant", "memoryconfiguration",
+            } and isinstance(value, str):
+                m = pair_re_no_ram.search(value)
+                if m:
+                    pair = (
+                        normalize_capacity(f"{m.group('storage')} {m.group('unit')}"),
+                        normalize_capacity(f"{m.group('ram')} GB"),
+                    )
+                    ram_num = int(re.search(r"\d+", pair[1]).group())
+                    if ram_num in valid_ram_gb:
+                        return pair
+
+        ram = storage = ""
+        ram_keys = {"ram", "ramsize", "memory", "memorysize", "ramgb"}
+        storage_keys = {
+            "storage", "storagesize", "rom", "romsize", "internalstorage",
+            "storagegb", "capacity",
+        }
+
+        for key, value in obj.items():
+            nk = _norm_field_name(key)
+            if not isinstance(value, (str, int, float)):
+                continue
+            value = clean(str(value))
+            if nk in ram_keys and re.search(r"\b(?:2|3|4|6|8|12|16|18|24|32)\s*GB\b", value, re.I):
+                ram = value
+            elif nk in storage_keys and re.search(r"\b\d{2,4}\s*(?:GB|TB)\b", value, re.I):
+                storage = value
+
+        if ram and storage:
+            rm = re.search(r"\b(\d{1,2})\s*GB\b", ram, re.I)
+            sm = re.search(r"\b(\d{2,4})\s*(GB|TB)\b", storage, re.I)
+            if rm and sm and int(rm.group(1)) in valid_ram_gb:
+                return (
+                    normalize_capacity(f"{sm.group(1)} {sm.group(2)}"),
+                    normalize_capacity(f"{rm.group(1)} GB"),
+                )
+        return None
+
+    def _walk_variant_objects(value, depth=0):
+        if depth > 12:
+            return
+        if isinstance(value, dict):
+            color = _variant_color_value(value)
+            pair = _variant_pair_value(value)
+            if color and pair:
+                yield color, pair[0], pair[1]
+            for child in value.values():
+                yield from _walk_variant_objects(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                yield from _walk_variant_objects(child, depth + 1)
+
+    # Parse JSON-bearing script tags first. This covers Next.js __NEXT_DATA__,
+    # JSON-LD and ordinary application state blobs without depending on a
+    # particular framework.
+    for tag in soup.find_all("script"):
+        raw_script = tag.string or tag.get_text(" ", strip=True)
+        if not raw_script or len(raw_script) > 2_000_000:
+            continue
+        raw_script = raw_script.strip()
+        candidates_json = []
+        if tag.get("type", "").lower() in {"application/json", "application/ld+json"}:
+            candidates_json.append(raw_script)
+        elif raw_script.startswith(("{", "[")) and raw_script.endswith(("}", "]")):
+            candidates_json.append(raw_script)
+
+        for raw_json in candidates_json:
+            try:
+                data = json.loads(raw_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for color, storage, ram in _walk_variant_objects(data):
+                add(color, storage, ram)
+
+    # Some stores embed JSON inside a JavaScript assignment rather than a pure
+    # JSON script tag. Look for small JSON objects containing both a colour and
+    # RAM/storage field, then parse the balanced object. This is deliberately
+    # bounded so arbitrary page text cannot become a variant.
+    for marker in (
+        '"variants"', '"skus"', '"skuList"', '"productVariants"',
+        '"variantList"', '"options"', '"products"',
+    ):
+        start = 0
+        while True:
+            idx = script_blob.find(marker, start)
+            if idx < 0:
+                break
+            brace = script_blob.find("{", idx)
+            if brace < 0 or brace - idx > 500:
+                start = idx + len(marker)
+                continue
+            depth = 0
+            in_str = False
+            esc = False
+            end = None
+            for pos in range(brace, min(len(script_blob), brace + 50000)):
+                ch = script_blob[pos]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = pos + 1
+                        break
+            if end:
+                fragment = script_blob[brace:end]
+                try:
+                    data = json.loads(fragment)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    data = None
+                if data is not None:
+                    for color, storage, ram in _walk_variant_objects(data):
+                        add(color, storage, ram)
+            start = idx + len(marker)
+
+    # If we found real SKU relationships, return them immediately. Do NOT
+    # continue to the generic capacity x colour Cartesian product below.
+    # Structured SKU evidence is stronger and prevents false combinations.
+    if found:
+        return found
 
     # 4) JSON/embedded-store fallback. E-commerce pages frequently keep the
     # selector data in script/JSON rather than visible text. Read only explicit
