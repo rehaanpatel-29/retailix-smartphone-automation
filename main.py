@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import re
 import json
+import html as html_lib
 import shutil
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse, quote_plus
@@ -193,7 +194,7 @@ def _render_page_with_browser(url, timeout=30):
             try:
                 visible_text = page.locator("body").inner_text(timeout=5000)
                 if visible_text and len(visible_text) > 300:
-                    rendered += "\n<!-- RETAILIX_RENDERED_VISIBLE_TEXT -->\n<pre>" + visible_text + "</pre>"
+                    rendered += "\n<!-- RETAILIX_RENDERED_VISIBLE_TEXT -->\n<pre>" + html_lib.escape(visible_text) + "</pre>"
             except Exception:
                 pass
 
@@ -1248,7 +1249,22 @@ def extract_variants(html, model):
     We never use a news-site variant list as product data.
     """
     soup = BeautifulSoup(html, "html.parser")
+
+    # If Playwright supplied visible page text, use that text as a distinct
+    # source for selector parsing. Do not let BeautifulSoup flatten or merge
+    # the actual rendered selector lines into adjacent DOM text. The marker is
+    # generic and applies to any JS-rendered official commerce page.
     text_raw = soup.get_text("\n", strip=True)
+    rendered_match = re.search(
+        r"<!--\s*RETAILIX_RENDERED_VISIBLE_TEXT\s*-->\s*<pre>(.*?)</pre>",
+        html or "", re.I | re.S,
+    )
+    if rendered_match:
+        rendered_text = BeautifulSoup(rendered_match.group(1), "html.parser").get_text("", strip=False)
+        rendered_text = html_lib.unescape(rendered_text)
+        if len(rendered_text.strip()) > 100:
+            text_raw = rendered_text.strip()
+
     text = clean(text_raw)
     found = []
     colors = []
@@ -1713,6 +1729,15 @@ def extract_variants(html, model):
         for storage, ram in capacities:
             for color in colors:
                 add(color, storage, ram)
+
+    if not found:
+        # Useful, non-sensitive diagnostic: tells us whether the failure is
+        # selector parsing or missing source data, without logging the whole page.
+        print(
+            "VARIANT DEBUG: no combinations extracted; "
+            f"capacity_options={len(capacities)}, colour_options={len(colors)}, "
+            f"rendered_text={'yes' if rendered_match else 'no'}"
+        )
 
     return found
 
