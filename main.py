@@ -186,18 +186,51 @@ def _render_page_with_browser(url, timeout=30):
 
             rendered = page.content()
 
-            # Preserve the rendered human-visible text explicitly. Some JS
-            # stores place selector values in client-side shadow/application
-            # state where BeautifulSoup sees only the shell markup. Appending
-            # body.innerText gives the normal parser the exact text a user sees
-            # without inventing any product data.
+            # Preserve rendered human-visible text explicitly. Some JS stores
+            # render a short product selector even when the rest of the page is
+            # blocked or sparse, so do not impose a 300-character threshold.
+            # The text is evidence from the official page, not generated data.
+            visible_text = ""
             try:
-                visible_text = page.locator("body").inner_text(timeout=5000)
-                if visible_text and len(visible_text) > 300:
-                    rendered += "\n<!-- RETAILIX_RENDERED_VISIBLE_TEXT -->\n<pre>" + html_lib.escape(visible_text) + "</pre>"
-            except Exception:
-                pass
+                visible_text = page.locator("body").inner_text(timeout=5000) or ""
+            except Exception as exc:
+                print(f"Browser visible-text capture failed for {url}: {exc}")
 
+            # Also capture visible option/input labels generically. This helps
+            # with stores that render color swatches as buttons with aria-labels
+            # and capacities as selectable options rather than body text.
+            selector_text = ""
+            try:
+                selector_text = page.evaluate(r"""() => {
+                    const out = [];
+                    const selectors = [
+                      'select option', '[role=option]', '[role=radio]',
+                      'button[aria-label]', '[aria-label*="color" i]',
+                      '[aria-label*="colour" i]', '[aria-label*="storage" i]',
+                      '[data-color]', '[data-colour]', '[data-sku]',
+                      '[class*="color"] [title]', '[class*="colour"] [title]'
+                    ];
+                    for (const sel of selectors) {
+                      for (const el of document.querySelectorAll(sel)) {
+                        const v = [el.innerText, el.getAttribute('aria-label'),
+                                   el.getAttribute('title'), el.getAttribute('data-color'),
+                                   el.getAttribute('data-colour'), el.getAttribute('data-sku'),
+                                   el.value].filter(Boolean).join(' ').trim();
+                        if (v) out.push(v);
+                      }
+                    }
+                    return [...new Set(out)].join('\n');
+                }""") or ""
+            except Exception as exc:
+                print(f"Browser selector capture failed for {url}: {exc}")
+
+            evidence_text = "\n".join(x for x in (visible_text, selector_text) if x).strip()
+            if evidence_text:
+                rendered += "\n<!-- RETAILIX_RENDERED_VISIBLE_TEXT -->\n<pre>" + html_lib.escape(evidence_text) + "</pre>"
+            print(
+                f"Browser render diagnostics: title={clean(page.title())[:100]!r}, "
+                f"visible_chars={len(visible_text)}, selector_chars={len(selector_text)}"
+            )
             return rendered
     except Exception as exc:
         print(f"Browser render unavailable for {url}: {exc}")
@@ -1010,6 +1043,7 @@ def find_official_product_page(model, brand):
         html = get_html(override_url, timeout=20)
         if html and official_page_is_india(override_url):
             return override_url, html
+        print(f"Official product override unavailable; continuing locator search: {override_url}")
 
     # 1) Try common official India product URL patterns first. This avoids
     # search-engine dependence and is very fast for brands such as vivo/realme.
