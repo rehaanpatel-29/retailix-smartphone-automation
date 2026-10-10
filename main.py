@@ -939,6 +939,7 @@ OFFICIAL_PRODUCT_OVERRIDES = {
     ("VIVO", "vivo s2 fe"): "https://shop.vivo.com/in/product/10374",
     ("VIVO", "vivo v80"): "https://shop.vivo.com/in/product/10373",
     ("REALME", "realme p4s lite"): "https://buy.realme.com/in/goods/824",
+    ("INFINIX", "infinix smart 20 hd"): "https://infinixmobiles.in/collections/smart-series/products/smart-20-hd",
 }
 
 
@@ -1300,6 +1301,12 @@ def official_fallback_variants(brand, model):
     whose variant matrix is rendered by JavaScript and therefore is invisible
     to the plain HTTP HTML returned in GitHub Actions.
     """
+    if brand.upper() == "INFINIX" and model_key(model) == "infinix smart 20 hd":
+        # Official Infinix India Smart 20 HD page: all three colours share
+        # the explicitly displayed 3GB RAM + 64GB storage configuration.
+        colors = ["Sunlike Orange", "Silver Dancer", "Night Pulse"]
+        return [(color, "64 GB", "3 GB") for color in colors]
+
     if brand.upper() == "OPPO" and "f35" in model.lower():
         # Official OPPO India F35 5G specs: 6GB+128GB and 8GB+128GB;
         # colours: Mist Pink, Titanium Grey, Wave Blue.
@@ -2125,6 +2132,22 @@ def main():
             variants = official_fallback_variants(brand, model)
             if variants:
                 print("Official OPPO F35 verified variant fallback: 6")
+
+        # The official Infinix Smart 20 HD India page exposes the selected
+        # 3GB/64GB SKU and all three official colour options. Merge these
+        # explicitly verified same-configuration colours if live parsing is sparse.
+        if brand.upper() == "INFINIX" and model_key(model) == "infinix smart 20 hd":
+            verified_infinix = official_fallback_variants(brand, model)
+            merged = []
+            seen_variant_keys = set()
+            for candidate in list(variants) + list(verified_infinix):
+                color, storage, ram = candidate
+                variant_key = make_variant_key(name, brand, color, storage, ram)
+                if variant_key not in seen_variant_keys:
+                    seen_variant_keys.add(variant_key)
+                    merged.append(candidate)
+            variants = merged
+            print("Official Infinix Smart 20 HD verified variants merged with page extraction:", len(variants))
 
         if len(description) < 60:
             print("SKIPPED: official product description not verified.")
