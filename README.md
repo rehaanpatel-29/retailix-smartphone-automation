@@ -103,5 +103,4 @@ Computer Science Graduate | Data Analyst Intern
 [GitHub Profile](https://github.com/rehaanpatel-29)
 
 ---
-
 *Developed to address a practical product management challenge through process automation and structured data handling.*
