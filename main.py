@@ -2080,15 +2080,25 @@ def main():
         variants = extract_variants(official_html, name)
 
         # Narrow recovery for these three exact Vivo India e-store product pages.
-        # Their complete official colour/configuration lists were verified in
-        # earlier runs, but the store's rendered DOM exposes only the currently
-        # selected SKU to the generic parser. This fallback is model-specific;
-        # it does not create combinations for other brands or phones.
-        if brand.upper() == "VIVO" and not variants:
-            variants = official_vivo_verified_fallback(model)
-            if variants:
+        # The full colour/configuration lists were verified in earlier official
+        # store runs, while the current JS-rendered DOM exposes only the selected
+        # SKU. Always merge the verified list with live extraction (not only when
+        # extraction is empty), then let the normal duplicate checker decide what
+        # is missing. This is model-specific and does not affect other phones.
+        if brand.upper() == "VIVO":
+            verified_vivo = official_vivo_verified_fallback(model)
+            if verified_vivo:
+                merged = []
+                seen_variant_keys = set()
+                for candidate in list(variants) + list(verified_vivo):
+                    color, storage, ram = candidate
+                    variant_key = make_variant_key(name, brand, color, storage, ram)
+                    if variant_key not in seen_variant_keys:
+                        seen_variant_keys.add(variant_key)
+                        merged.append(candidate)
+                variants = merged
                 print(
-                    "Official Vivo verified variant fallback:",
+                    "Official Vivo verified variants merged with page extraction:",
                     len(variants),
                 )
 
