@@ -1801,18 +1801,25 @@ def extract_variants(html, model):
                     if valid_color_candidate(value) and value.lower() not in {x.lower() for x in colors}:
                         colors.append(value)
 
-    if capacities and colors:
-        for storage, ram in capacities:
-            for color in colors:
-                add(color, storage, ram)
+    # Safety rule: never infer every colour x RAM/storage combination from
+    # independent option lists. Those lists can include unrelated page content
+    # or configurations that are not sold in every colour. Only return variants
+    # tied together by explicit selected-SKU text or a structured SKU/variant
+    # object above. If the official page exposes only separate selector lists,
+    # skip the product and log the evidence counts instead of inventing SKUs.
 
     if not found:
         # Useful, non-sensitive diagnostic: tells us whether the failure is
         # selector parsing or missing source data, without logging the whole page.
         print(
-            "VARIANT DEBUG: no combinations extracted; "
+            "VARIANT DEBUG: no verified SKU combinations extracted; "
             f"capacity_options={len(capacities)}, colour_options={len(colors)}, "
             f"rendered_text={'yes' if rendered_match else 'no'}"
+        )
+    elif capacities and colors:
+        print(
+            "VARIANT SAFETY: ignored independent colour/capacity option lists; "
+            "only explicit SKU-linked combinations were retained."
         )
 
     return found
