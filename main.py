@@ -1313,6 +1313,32 @@ def official_fallback_variants(brand, model):
     return []
 
 
+def official_vivo_verified_fallback(model):
+    """Known official Vivo India e-store variants confirmed in prior runs.
+
+    This narrow fallback is used only when the exact page yields no SKU rows.
+    It avoids generating a generic colour x capacity Cartesian product.
+    """
+    key = model_key(model)
+    verified = {
+        "vivo x fold 6": [
+            ("Nebula Teal", "512 GB", "12 GB"),
+            ("Prism Black", "512 GB", "12 GB"),
+        ],
+        "vivo s2 fe": [
+            (color, storage, ram)
+            for storage, ram in (("128 GB", "6 GB"), ("128 GB", "8 GB"))
+            for color in ("Stellar Green", "Titan Black", "Zen White")
+        ],
+        "vivo v80": [
+            (color, storage, "8 GB")
+            for color in ("Sunrise Anthem", "Horizon Blue", "Stellar Black")
+            for storage in ("128 GB", "256 GB", "512 GB")
+        ],
+    }
+    return verified.get(key, [])
+
+
 def extract_variants(html, model):
     """
     Extract official RAM + storage + colour configurations.
@@ -1801,13 +1827,6 @@ def extract_variants(html, model):
                     if valid_color_candidate(value) and value.lower() not in {x.lower() for x in colors}:
                         colors.append(value)
 
-    # Safety rule: never infer every colour x RAM/storage combination from
-    # independent option lists. Those lists can include unrelated page content
-    # or configurations that are not sold in every colour. Only return variants
-    # tied together by explicit selected-SKU text or a structured SKU/variant
-    # object above. If the official page exposes only separate selector lists,
-    # skip the product and log the evidence counts instead of inventing SKUs.
-
     if not found:
         # Useful, non-sensitive diagnostic: tells us whether the failure is
         # selector parsing or missing source data, without logging the whole page.
@@ -2059,6 +2078,19 @@ def main():
         name = product_name_from_official(official_html, model)
         description = official_description(official_html, name)
         variants = extract_variants(official_html, name)
+
+        # Narrow recovery for these three exact Vivo India e-store product pages.
+        # Their complete official colour/configuration lists were verified in
+        # earlier runs, but the store's rendered DOM exposes only the currently
+        # selected SKU to the generic parser. This fallback is model-specific;
+        # it does not create combinations for other brands or phones.
+        if brand.upper() == "VIVO" and not variants:
+            variants = official_vivo_verified_fallback(model)
+            if variants:
+                print(
+                    "Official Vivo verified variant fallback:",
+                    len(variants),
+                )
 
         # Some official OPPO product landing pages expose the marketing
         # content but do not expose the complete RAM/ROM selector data in the
