@@ -2151,6 +2151,32 @@ def main():
             if variants:
                 print("Official OPPO F35 verified variant fallback: 6")
 
+        # Samsung Galaxy F70: some Samsung product pages expose only the
+        # marketing page in the initial response, while the official specs
+        # endpoint may contain the actual RAM/storage SKU data. Check that
+        # second official India endpoint before skipping the phone. Do not
+        # infer RAM/storage from a news article or combine independent option
+        # lists into synthetic SKUs.
+        if (
+            not variants
+            and brand.upper() == "SAMSUNG"
+            and model_key(model) == "samsung galaxy f70"
+        ):
+            samsung_specs_url = "https://www.samsung.com/in/smartphones/galaxy-f/f70/specs/"
+            samsung_specs_html = get_html(samsung_specs_url, timeout=30)
+            if samsung_specs_html:
+                print("Official Samsung specs fallback:", samsung_specs_url)
+                variants = extract_variants(samsung_specs_html, name)
+                if len(description) < 60:
+                    description = official_description(samsung_specs_html, name)
+            if not variants:
+                print(
+                    "Samsung Galaxy F70 safety check: the official India "
+                    "page/specs endpoint did not expose verifiable linked "
+                    "RAM + Storage + Colour combinations; no variants will "
+                    "be guessed."
+                )
+
         # The official Infinix Smart 20 HD India page exposes the selected
         # 3GB/64GB SKU and all three official colour options. Merge these
         # explicitly verified same-configuration colours if live parsing is sparse.
