@@ -914,9 +914,36 @@ def _official_url_matches_model(url, model):
     words = _official_model_words(model)
     if not words:
         return False
-    # Require every meaningful token.  This prevents X Fold6 from matching
-    # X Fold5 and S2 FE from matching unrelated vivo pages.
-    return all(re.search(r"\b" + re.escape(w) + r"\b", blob) for w in words)
+
+    # The official brand domain already establishes the manufacturer. Some
+    # official product URLs omit the brand name (for example, Samsung uses
+    # /galaxy-f/f70/). Do not require the brand token in the URL path, but keep
+    # every distinguishing model token so F70 cannot match F70e or F70 Pro.
+    brand_tokens = {
+        "apple", "infinix", "motorola", "oneplus", "oppo", "poco",
+        "redmi", "realme", "samsung", "vivo", "xiaomi",
+    }
+    distinguishing = [w for w in words if w not in brand_tokens]
+    if not distinguishing:
+        distinguishing = words
+
+    if not all(
+        re.search(r"\b" + re.escape(w) + r"\b", blob)
+        for w in distinguishing
+    ):
+        return False
+
+    # Avoid accepting a sibling model that adds a meaningful suffix absent
+    # from the requested model (e.g. F70 Pro when looking for Galaxy F70).
+    model_tokens = set(words)
+    suffixes = ("pro", "plus", "ultra", "fe", "lite", "neo", "max", "mini", "edge")
+    for token in distinguishing:
+        for suffix in suffixes:
+            pattern = r"\b" + re.escape(token) + r"[- ]+" + suffix + r"\b"
+            if re.search(pattern, blob) and suffix not in model_tokens:
+                return False
+
+    return True
 
 
 def _official_page_matches_model(html, model):
@@ -1194,6 +1221,66 @@ def find_official_product_page(model, brand):
         return url, html
 
     return "", ""
+
+
+def discover_samsung_f70_sku_pages(model, seed_html=""):
+    """
+    Find additional Samsung India pages for the exact F70 model.
+
+    The marketing page may expose colours but not purchasable SKU details.
+    This searches only Samsung's own India product links/sitemaps for
+    model-specific pages. No RAM/storage/colour combinations are inferred.
+    """
+    domain = "samsung.com"
+    candidates = []
+    seen = set()
+
+    def add_url(url):
+        url = normalize_url(url)
+        if not url or url in seen:
+            return
+        if not same_domain(url, [domain]) or not official_page_is_india(url):
+            return
+        path = urlparse(url).path.lower()
+        if "f70" not in path:
+            return
+        if any(token in path for token in (
+            "/support", "/help", "/careers", "/about", "/privacy",
+            "/terms", "/store-locator",
+        )):
+            return
+        if not _official_url_matches_model(url, model):
+            return
+        seen.add(url)
+        candidates.append(url)
+
+    if seed_html:
+        soup = BeautifulSoup(seed_html, "html.parser")
+        for tag in soup.find_all("a", href=True):
+            add_url(normalize_url(tag.get("href"), "https://www.samsung.com"))
+
+    try:
+        for url in _sitemap_product_candidates(domain, model, limit=2500):
+            add_url(url)
+    except Exception as exc:
+        print(f"Samsung official SKU sitemap lookup unavailable: {exc}")
+
+    def score(url):
+        path = urlparse(url).path.lower()
+        value = 0
+        if re.search(r"sm-[a-z0-9]+", path):
+            value += 20
+        if re.search(r"(?:128|256|512)gb", path):
+            value += 10
+        if any(x in path for x in ("buy", "product", "multistore")):
+            value += 5
+        if path.rstrip("/").endswith("/f70"):
+            value -= 20
+        if path.rstrip("/").endswith("/specs"):
+            value -= 10
+        return value
+
+    return sorted(candidates, key=lambda url: (-score(url), url))[:30]
 
 
 # ------------------------------------------------------------
@@ -2169,12 +2256,39 @@ def main():
                 variants = extract_variants(samsung_specs_html, name)
                 if len(description) < 60:
                     description = official_description(samsung_specs_html, name)
+            # If the marketing and specs endpoints omit SKU data, check
+            # additional exact-model pages on Samsung's own India domain.
+            # Each page is independently fetched and parsed; variants are
+            # accepted only when that same official page exposes linked
+            # colour, RAM, and storage in one explicit SKU/configuration.
+            if not variants:
+                sku_pages = discover_samsung_f70_sku_pages(model, official_html)
+                print("Samsung official F70 SKU pages discovered:", len(sku_pages))
+                seen_samsung_variants = set()
+                for sku_url in sku_pages:
+                    sku_html = get_html(sku_url, timeout=25)
+                    if not sku_html or not _official_page_matches_model(sku_html, model):
+                        continue
+                    sku_variants = extract_variants(sku_html, name)
+                    for color, storage, ram in sku_variants:
+                        variant_key = make_variant_key(name, brand, color, storage, ram)
+                        if variant_key not in seen_samsung_variants:
+                            seen_samsung_variants.add(variant_key)
+                            variants.append((color, storage, ram))
+                    if sku_variants:
+                        print(
+                            "Samsung official SKU page parsed:",
+                            sku_url,
+                            "| cumulative verified variants:",
+                            len(variants),
+                        )
+
             if not variants:
                 print(
-                    "Samsung Galaxy F70 safety check: the official India "
-                    "page/specs endpoint did not expose verifiable linked "
-                    "RAM + Storage + Colour combinations; no variants will "
-                    "be guessed."
+                    "Samsung Galaxy F70 safety check: no official India "
+                    "page exposed verifiable linked RAM + Storage + Colour "
+                    "combinations. The phone remains unadded; no variants "
+                    "will be guessed."
                 )
 
         # The official Infinix Smart 20 HD India page exposes the selected
