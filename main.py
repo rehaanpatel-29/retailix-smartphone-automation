@@ -1287,22 +1287,16 @@ def discover_samsung_f70_sku_pages(model, seed_html=""):
         for tag in soup.find_all("a", href=True):
             add_url(normalize_url(tag.get("href"), "https://www.samsung.com"))
 
-    # The general official-page locator has already searched Samsung's
-    # sitemap for this exact model earlier in this run. Re-crawling up to
-    # 2,500 sitemap documents here repeats expensive network work. Only run
-    # the extra sitemap crawl if the official seed page yielded no exact-model
-    # links at all; any variants still require direct official-page evidence.
-    if not candidates:
-        try:
-            for url in _sitemap_product_candidates(domain, model, limit=2500):
-                add_url(url)
-        except Exception as exc:
-            print(f"Samsung official SKU sitemap lookup unavailable: {exc}")
-    else:
-        print(
-            "Samsung official SKU sitemap crawl skipped: exact-model links "
-            "already found on the official seed page."
-        )
+    # find_official_product_page() already ran the official-domain sitemap
+    # discovery for this model earlier in this same run. Do not crawl the
+    # Samsung sitemap a second time here: that repeats the same failing
+    # endpoints and can add minutes without improving variant verification.
+    # This function only inspects exact-model links found on the official seed
+    # page. If those links do not expose verifiable variants, fail closed.
+    print(
+        "Samsung SKU sitemap retry skipped: official-domain sitemap discovery "
+        "already ran during product-page lookup."
+    )
 
     def score(url):
         path = urlparse(url).path.lower()
