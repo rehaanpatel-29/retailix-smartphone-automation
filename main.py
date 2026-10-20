@@ -152,15 +152,30 @@ def _render_page_with_browser(url, timeout=30):
                 user_agent=SESSION.headers["User-Agent"],
                 locale="en-IN",
             )
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            # Use a bounded navigation timeout. Waiting for network-idle can
+            # consume 15 seconds on sites with analytics/persistent requests,
+            # even when the page is already an error page.
+            page.goto(url, wait_until="domcontentloaded", timeout=min(timeout, 15) * 1000)
 
-            # JS commerce pages often render the product shell first and the
-            # actual selector data several seconds later. Do not treat
-            # DOMContentLoaded as proof that product data is ready.
+            # Fail fast on explicit error pages. Do not spend additional time
+            # scrolling or waiting for variant selectors that cannot exist on
+            # a server-generated 404/error page. Return its HTML for existing
+            # callers' normal safety checks; this does not create product data.
             try:
-                page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 15000))
+                early_title = clean(page.title()).lower()
+                early_text = (page.locator("body").inner_text(timeout=1500) or "")[:2500]
+                error_markers = (
+                    "error | samsung india", "page not found", "404 not found",
+                    "this page isn’t available", "this page isn't available",
+                )
+                if any(marker in early_title for marker in error_markers):
+                    print(
+                        f"Browser fast-fail: error page title={early_title[:100]!r} "
+                        f"url={url}"
+                    )
+                    return page.content()
             except Exception:
-                pass
+                early_text = ""
 
             # Trigger lazy-loaded product sections. This is generic and does
             # not click any purchase/checkout controls.
@@ -1272,11 +1287,22 @@ def discover_samsung_f70_sku_pages(model, seed_html=""):
         for tag in soup.find_all("a", href=True):
             add_url(normalize_url(tag.get("href"), "https://www.samsung.com"))
 
-    try:
-        for url in _sitemap_product_candidates(domain, model, limit=2500):
-            add_url(url)
-    except Exception as exc:
-        print(f"Samsung official SKU sitemap lookup unavailable: {exc}")
+    # The general official-page locator has already searched Samsung's
+    # sitemap for this exact model earlier in this run. Re-crawling up to
+    # 2,500 sitemap documents here repeats expensive network work. Only run
+    # the extra sitemap crawl if the official seed page yielded no exact-model
+    # links at all; any variants still require direct official-page evidence.
+    if not candidates:
+        try:
+            for url in _sitemap_product_candidates(domain, model, limit=2500):
+                add_url(url)
+        except Exception as exc:
+            print(f"Samsung official SKU sitemap lookup unavailable: {exc}")
+    else:
+        print(
+            "Samsung official SKU sitemap crawl skipped: exact-model links "
+            "already found on the official seed page."
+        )
 
     def score(url):
         path = urlparse(url).path.lower()
