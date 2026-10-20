@@ -247,29 +247,39 @@ def _render_page_with_browser(url, timeout=30):
             pass
 
 
-def get_html(url, timeout=30):
-    """Fetch a page directly; render JS-heavy official commerce pages when needed."""
-    html = ""
+def _get_http_text(url, timeout=15):
+    """Fetch text resources over HTTP only; never start a browser as fallback.
+
+    robots.txt and sitemap XML can be valid when shorter than 300 characters,
+    and do not need JavaScript rendering.
+    """
     try:
-        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
-        if r.ok and len(r.text) > 300:
-            html = r.text
-    except requests.RequestException:
-        pass
+        response = SESSION.get(url, timeout=timeout, allow_redirects=True)
+        if response.ok:
+            return response.text or ""
+        print(f"HTTP resource unavailable: status={response.status_code} url={url}")
+    except requests.RequestException as exc:
+        print(f"HTTP resource request failed: url={url} error={exc}")
+    return ""
+
+
+def get_html(url, timeout=30):
+    """Fetch a product/article page; render when the page needs JavaScript."""
+    html = _get_http_text(url, timeout=timeout)
 
     if html and _looks_like_js_commerce_page(url, html):
         rendered = _render_page_with_browser(url, timeout=timeout)
-        # A rendered DOM can legitimately be smaller than the original
-        # JavaScript application shell. Length is not evidence that the
-        # rendered page is worse. For known JS-heavy commerce stores, prefer
-        # the rendered DOM whenever it is non-empty.
+        # For known JS-heavy commerce pages, prefer the rendered DOM when it
+        # contains useful content. Rendering remains page-specific.
         if rendered and len(rendered) > 300:
             print(f"Rendered official JS page: {url}")
             return rendered
 
-    if html:
+    if html and len(html) > 300:
         return html
 
+    # Keep browser fallback for product/article pages only. Sitemap and robots
+    # resources call _get_http_text() directly and never launch Chromium.
     return _render_page_with_browser(url, timeout=timeout)
 
 
@@ -1002,8 +1012,10 @@ def _sitemap_locations(domain):
         if url in seen:
             continue
         seen.add(url)
-        html = get_html(url, timeout=20)
-        if not html:
+        # robots.txt and sitemap endpoints are plain text/XML resources.
+        # Fetch directly so short valid responses never trigger Chromium.
+        html = _get_http_text(url, timeout=20)
+        if not html.strip():
             continue
         if url.endswith("robots.txt"):
             for line in html.splitlines():
@@ -1029,8 +1041,9 @@ def _sitemap_product_candidates(domain, model, limit=6000):
             continue
         seen.add(sm_url)
 
-        xml = get_html(sm_url, timeout=25)
-        if not xml or "<url" not in xml.lower() and "<sitemap" not in xml.lower():
+        # Sitemap XML is fetched via HTTP only; do not render it in a browser.
+        xml = _get_http_text(sm_url, timeout=25)
+        if not xml or ("<url" not in xml.lower() and "<sitemap" not in xml.lower()):
             continue
 
         # Use Python's built-in XML parser so GitHub Actions does not need
