@@ -1022,7 +1022,6 @@ def _sitemap_locations(domain):
         roots = [
             "https://samsung.com/robots.txt",
             "https://www.samsung.com/robots.txt",
-            "https://www.samsung.com/in/robots.txt",
             "https://www.samsung.com/sitemap.xml",
             "https://www.samsung.com/in/sitemap.xml",
         ]
@@ -2284,25 +2283,21 @@ def main():
             if variants:
                 print("Official OPPO F35 verified variant fallback: 6")
 
-        # Samsung Galaxy F70: some Samsung product pages expose only the
-        # marketing page in the initial response, while the official specs
-        # endpoint may contain the actual RAM/storage SKU data. Check that
-        # second official India endpoint before skipping the phone. Do not
-        # infer RAM/storage from a news article or combine independent option
-        # lists into synthetic SKUs.
+        # Samsung Galaxy F70: the known /specs/ endpoint has repeatedly
+        # returned HTTP 404 in GitHub Actions. Do not request that known-bad
+        # URL again. Continue only with exact-model official India SKU pages
+        # discovered from the working marketing page; never infer variants
+        # from independent RAM/storage/colour lists or third-party sources.
         if (
             not variants
             and brand.upper() == "SAMSUNG"
             and model_key(model) == "samsung galaxy f70"
         ):
-            samsung_specs_url = "https://www.samsung.com/in/smartphones/galaxy-f/f70/specs/"
-            samsung_specs_html = get_html(samsung_specs_url, timeout=30)
-            if samsung_specs_html:
-                print("Official Samsung specs fallback:", samsung_specs_url)
-                variants = extract_variants(samsung_specs_html, name)
-                if len(description) < 60:
-                    description = official_description(samsung_specs_html, name)
-            # If the marketing and specs endpoints omit SKU data, check
+            print(
+                "Samsung F70 known-404 specs endpoint skipped; "
+                "checking exact-model official India SKU pages only."
+            )
+            # If the marketing endpoint omits SKU data, check
             # additional exact-model pages on Samsung's own India domain.
             # Each page is independently fetched and parsed; variants are
             # accepted only when that same official page exposes linked
