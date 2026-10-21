@@ -1014,13 +1014,26 @@ OFFICIAL_PRODUCT_OVERRIDES = {
 
 
 def _sitemap_locations(domain):
-    roots = [
-        f"https://{domain}/robots.txt",
-        f"https://{domain}/sitemap.xml",
-        f"https://{domain}/sitemap_index.xml",
-        f"https://{domain}/in/sitemap.xml",
-        f"https://{domain}/in/sitemap_index.xml",
-    ]
+    # Samsung does not serve the generic sitemap_index.xml endpoints below
+    # on samsung.com / samsung.com/in in the current workflow. Probe robots.txt
+    # first and let it advertise the actual sitemap locations. Avoid knowingly
+    # requesting these invalid generic URLs on every Samsung product lookup.
+    if domain.lower().strip("/") == "samsung.com":
+        roots = [
+            "https://samsung.com/robots.txt",
+            "https://www.samsung.com/robots.txt",
+            "https://www.samsung.com/in/robots.txt",
+            "https://www.samsung.com/sitemap.xml",
+            "https://www.samsung.com/in/sitemap.xml",
+        ]
+    else:
+        roots = [
+            f"https://{domain}/robots.txt",
+            f"https://{domain}/sitemap.xml",
+            f"https://{domain}/sitemap_index.xml",
+            f"https://{domain}/in/sitemap.xml",
+            f"https://{domain}/in/sitemap_index.xml",
+        ]
     out = []
     seen = set()
     for url in roots:
