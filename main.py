@@ -2325,6 +2325,15 @@ def main():
                         )
 
             if not variants:
+                # Keep this model-specific failure diagnostic explicit. The
+                # official landing page may list colours without tying them to
+                # RAM/storage SKU objects; those independent lists are not
+                # sufficient to create database variants.
+                print(
+                    "Samsung Galaxy F70 official-page diagnostic: the current "
+                    "official HTML did not expose a complete linked "
+                    "RAM + Storage + Colour SKU."
+                )
                 print(
                     "Samsung Galaxy F70 safety check: no official India "
                     "page exposed verifiable linked RAM + Storage + Colour "
