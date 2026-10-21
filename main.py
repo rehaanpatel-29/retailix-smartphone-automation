@@ -667,10 +667,14 @@ def direct_source_candidates(source, start, end, test_mode):
         max_pages = NINETYONE_TEST_MAX_PAGES
         archive_start = start - timedelta(days=1)
         for page in range(1, max_pages + 1):
+            # Use the actual 91mobiles Mobiles category archive for historical
+            # discovery. The old /hub/search/ URL is a search interface, not a
+            # chronological article archive, so its paginated pages can return
+            # no launch articles even while the category archive contains them.
             url = (
-                NINETYONE_SEARCH_ARCHIVE
+                NINETYONE_MOBILES_CATEGORY
                 if page == 1
-                else f"{NINETYONE_SEARCH_ARCHIVE}page/{page}/"
+                else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
             )
             html = get_html(url, timeout=30)
             if not html:
@@ -798,10 +802,12 @@ def discover_source_candidates(source, start, end, test_mode):
     raw_candidates = direct_source_candidates(source, start, end, test_mode)
 
     for candidate in raw_candidates:
-        listing_date = candidate.get("published")
-        if listing_date and listing_date < start - timedelta(days=1):
-            continue
-
+        # Do not discard a candidate using the date parsed from a listing-card
+        # parent. Those cards can contain unrelated dates (for example, a
+        # date belonging to another article in the same container). Historical
+        # discovery already has a bounded page limit; the directly fetched
+        # article's publication date and launch-date evidence are checked in
+        # verify_publisher_article(), which is the authoritative date gate.
         brand = detect_brand(candidate.get("title", ""))
         if not brand:
             continue
@@ -2325,15 +2331,6 @@ def main():
                         )
 
             if not variants:
-                # Keep this model-specific failure diagnostic explicit. The
-                # official landing page may list colours without tying them to
-                # RAM/storage SKU objects; those independent lists are not
-                # sufficient to create database variants.
-                print(
-                    "Samsung Galaxy F70 official-page diagnostic: the current "
-                    "official HTML did not expose a complete linked "
-                    "RAM + Storage + Colour SKU."
-                )
                 print(
                     "Samsung Galaxy F70 safety check: no official India "
                     "page exposed verifiable linked RAM + Storage + Colour "
