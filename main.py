@@ -540,7 +540,11 @@ NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
 NINETYONE_MAX_PAGES = 5
 # Historical test mode needs a deeper archive scan because a test date can
 # be weeks behind the current publisher homepage. Production remains at 5.
-NINETYONE_TEST_MAX_PAGES = 40
+# Keep historical/manual runs bounded. The newest relevant launch articles are
+# normally near the front of the chronological category archive; scanning 40
+# pages can exceed GitHub Actions' 15-minute job timeout because pages may fall
+# back to Chromium rendering.
+NINETYONE_TEST_MAX_PAGES = 8
 NINETYONE_SEARCH_ARCHIVE = "https://www.91mobiles.com/hub/search/"
 
 
@@ -676,11 +680,16 @@ def direct_source_candidates(source, start, end, test_mode):
                 if page == 1
                 else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
             )
-            html = get_html(url, timeout=30)
+            print(f"91mobiles archive scan: page {page}/{max_pages} | {url}")
+            # Listing pages are expected to be plain article indexes. Keep each
+            # request bounded so one slow page cannot consume the whole job.
+            html = get_html(url, timeout=12)
             if not html:
+                print(f"91mobiles archive page unavailable: {page}")
                 continue
 
             page_candidates = parse_91mobiles_category(html)
+            print(f"91mobiles archive page {page}: {len(page_candidates)} article links")
             page_dates = [
                 c["published"] for c in page_candidates
                 if c.get("published")
@@ -808,10 +817,21 @@ def discover_source_candidates(source, start, end, test_mode):
         # discovery already has a bounded page limit; the directly fetched
         # article's publication date and launch-date evidence are checked in
         # verify_publisher_article(), which is the authoritative date gate.
-        brand = detect_brand(candidate.get("title", ""))
+        title = clean(candidate.get("title", ""))
+        brand = detect_brand(title)
         if not brand:
             continue
 
+        # Avoid opening every unrelated article in the archive. This is only a
+        # discovery prefilter; the full article still has to pass all existing
+        # launch, India, brand, and date checks below.
+        title_low = title.lower()
+        title_has_phone = any(word in title_low for word in SMARTPHONE_TITLE_WORDS)
+        title_has_launch = any(word in title_low for word in STRONG_LAUNCH_WORDS)
+        if not (title_has_phone and title_has_launch):
+            continue
+
+        print(f"Checking 91mobiles launch article: {title[:100]}")
         verified = verify_publisher_article(candidate, brand, start, end, test_mode)
         if not verified:
             continue
