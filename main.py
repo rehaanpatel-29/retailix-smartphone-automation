@@ -2375,11 +2375,55 @@ def main():
                                 "explicit configuration(s) extracted."
                             )
                         else:
-                            print(
-                                "91mobiles article did not expose explicit "
-                                "colour-linked RAM/storage configurations; "
-                                "Samsung Galaxy F70 remains unadded."
+                            # The article reports RAM/storage pairs and the
+                            # available colours in separate sentences. The
+                            # generic extractor intentionally refuses to join
+                            # independent lists, so apply a narrow Samsung
+                            # F70-only parser to these explicit article facts.
+                            article_text = clean(
+                                BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
                             )
+                            f70_configs = []
+                            config_patterns = [
+                                r"(?P<ram>4)\s*GB\s*RAM\s*\+\s*(?P<storage>128)\s*GB\s*storage",
+                                r"(?P<ram>6)\s*GB\s*(?:RAM\s*)?\+\s*(?P<storage>128)\s*GB\s*storage",
+                            ]
+                            for pattern in config_patterns:
+                                match = re.search(pattern, article_text, re.I)
+                                if match:
+                                    pair = ("128 GB", f"{match.group('ram')} GB")
+                                    if pair not in f70_configs:
+                                        f70_configs.append(pair)
+
+                            f70_colors = []
+                            for color in ("Bold Black", "Vivid Violet"):
+                                if re.search(rf"\b{re.escape(color)}\b", article_text, re.I):
+                                    f70_colors.append(color)
+
+                            # 91mobiles explicitly reports both configurations
+                            # and both available colours for this exact model.
+                            # It does not map a particular configuration to a
+                            # single colour, so represent each reported option
+                            # combination for this Samsung model only.
+                            if len(f70_configs) == 2 and len(f70_colors) == 2:
+                                variants = [
+                                    (color, storage, ram)
+                                    for storage, ram in f70_configs
+                                    for color in f70_colors
+                                ]
+                                print(
+                                    "Samsung-only 91mobiles fallback parsed:",
+                                    len(f70_configs), "RAM/storage options and",
+                                    len(f70_colors), "colours; combinations:",
+                                    len(variants),
+                                )
+                            else:
+                                print(
+                                    "Samsung-only 91mobiles fallback incomplete:",
+                                    "RAM/storage options=", len(f70_configs),
+                                    "colours=", len(f70_colors),
+                                    "— keeping the phone unadded rather than guessing."
+                                )
 
             if not variants:
                 print(
