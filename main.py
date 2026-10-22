@@ -2384,19 +2384,29 @@ def main():
                                 BeautifulSoup(article_html, "html.parser").get_text(" ", strip=True)
                             )
                             f70_configs = []
+                            # 91mobiles wording varies by configuration: the
+                            # first option may say "4GB RAM + 128GB storage
+                            # variant", while the second may say "6GB + 128GB
+                            # model". Parse each explicit pair independently.
                             config_patterns = [
-                                r"(?P<ram>4)\s*GB\s*RAM\s*\+\s*(?P<storage>128)\s*GB\s*storage",
-                                r"(?P<ram>6)\s*GB\s*(?:RAM\s*)?\+\s*(?P<storage>128)\s*GB\s*storage",
+                                r"(?P<ram>4)\s*GB\s*RAM\s*\+\s*(?P<storage>128)\s*GB(?:\s*storage)?",
+                                r"(?P<ram>6)\s*GB\s*(?:RAM\s*)?\+\s*(?P<storage>128)\s*GB(?:\s*storage)?",
                             ]
                             for pattern in config_patterns:
-                                match = re.search(pattern, article_text, re.I)
-                                if match:
+                                for match in re.finditer(pattern, article_text, re.I):
                                     pair = ("128 GB", f"{match.group('ram')} GB")
                                     if pair not in f70_configs:
                                         f70_configs.append(pair)
 
+                            # Colour names have changed between the teaser and
+                            # launch article. Accept the names explicitly
+                            # stated in the verified launch article, not only
+                            # the pre-launch teaser names.
                             f70_colors = []
-                            for color in ("Bold Black", "Vivid Violet"):
+                            for color in (
+                                "Lilac Bliss", "Bliss Black",
+                                "Bold Black", "Vivid Violet",
+                            ):
                                 if re.search(rf"\b{re.escape(color)}\b", article_text, re.I):
                                     f70_colors.append(color)
 
