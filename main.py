@@ -2350,10 +2350,42 @@ def main():
                             len(variants),
                         )
 
+            # Samsung-only exception approved by the project owner:
+            # use the verified 91mobiles launch article as a fallback for
+            # Galaxy F70 RAM/storage/colour configuration evidence when
+            # Samsung's official India page exposes no parseable SKU matrix.
+            # This fallback is deliberately limited to Samsung Galaxy F70;
+            # all other brands continue to require official product-page data.
+            if not variants:
+                launch_article_url = item.get("url", "")
+                if launch_article_url:
+                    print(
+                        "Samsung Galaxy F70: official SKU data unavailable; "
+                        "checking the verified 91mobiles launch article for "
+                        "RAM/storage configurations."
+                    )
+                    article_html = get_html(launch_article_url, timeout=20)
+                    if article_html:
+                        article_variants = extract_variants(article_html, name)
+                        if article_variants:
+                            variants = article_variants
+                            print(
+                                "Samsung-only 91mobiles variant fallback: ",
+                                len(variants),
+                                "explicit configuration(s) extracted."
+                            )
+                        else:
+                            print(
+                                "91mobiles article did not expose explicit "
+                                "colour-linked RAM/storage configurations; "
+                                "Samsung Galaxy F70 remains unadded."
+                            )
+
             if not variants:
                 print(
-                    "Samsung Galaxy F70 safety check: no official India "
-                    "page exposed verifiable linked RAM + Storage + Colour "
+                    "Samsung Galaxy F70 safety check: neither Samsung's "
+                    "official India page nor its verified 91mobiles launch "
+                    "article exposed usable linked RAM + Storage + Colour "
                     "combinations. The phone remains unadded; no variants "
                     "will be guessed."
                 )
