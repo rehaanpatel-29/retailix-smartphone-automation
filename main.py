@@ -542,6 +542,9 @@ SMARTPHONE_TITLE_WORDS = (
 )
 
 NINETYONE_MOBILES_CATEGORY = "https://www.91mobiles.com/hub/category/mobiles/"
+# WordPress category RSS endpoint. Keep this explicitly defined because both
+# feed parsing and discovery use it; an unavailable feed is handled gracefully.
+NINETYONE_CATEGORY_FEED = NINETYONE_MOBILES_CATEGORY.rstrip("/") + "/feed/"
 NINETYONE_MAX_PAGES = 5
 # Historical test mode needs a deeper archive scan because a test date can
 # be weeks behind the current publisher homepage. Production remains at 5.
