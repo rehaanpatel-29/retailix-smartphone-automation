@@ -760,16 +760,31 @@ def direct_source_candidates(source, start, end, test_mode):
     add_many(feed_candidates)
 
     # Publisher on-site search is a second discovery route on the same domain.
-    # Search every configured brand, not just the brands seen in archive titles,
-    # so a missing archive card does not hide a launch article.
+    # Search both the brand name and launch-specific phrases. Brand-only search
+    # can rank rumours, reviews and old stories above the actual launch report.
     for brand in BRANDS:
-        search_url = NINETYONE_SEARCH_ARCHIVE + "?s=" + quote_plus(brand.lower())
-        html = get_html(search_url, timeout=15)
-        if not html:
-            continue
-        search_candidates = parse_91mobiles_category(html)
-        print(f"91mobiles on-site search {brand}: {len(search_candidates)} article links")
-        add_many(search_candidates)
+        queries = (
+            brand.lower(),
+            f"{brand.lower()} launched in India",
+            f"{brand.lower()} smartphone launch India",
+        )
+        for query in queries:
+            search_url = NINETYONE_SEARCH_ARCHIVE + "?s=" + quote_plus(query)
+            html = get_html(search_url, timeout=15)
+            if not html:
+                print(f"91mobiles on-site search unavailable: {brand} | {query}")
+                continue
+            search_candidates = parse_91mobiles_category(html)
+            launch_candidates = [
+                item for item in search_candidates
+                if title_looks_like_phone_launch(item.get("title", ""))
+            ]
+            print(
+                f"91mobiles on-site search {brand} [{query}]: "
+                f"{len(search_candidates)} links, "
+                f"{len(launch_candidates)} launch-title candidates"
+            )
+            add_many(launch_candidates)
 
     print("91mobiles total unique article candidates:", len(candidates))
     return candidates
