@@ -5,6 +5,7 @@ import json
 import html as html_lib
 import shutil
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse, quote_plus
 import xml.etree.ElementTree as ET
 
@@ -29,8 +30,9 @@ from openpyxl import load_workbook
 #
 # IMPORTANT:
 #   - Only selected brands are processed.
-#   - Only phones with an India release date in the previous
-#     24 hours are considered.
+#   - Production discovery uses a 7-day recovery window so a missed
+#     scheduled run does not permanently lose a launch. Duplicate checks
+#     make repeated discovery safe.
 #   - Upcoming / rumours / reviews / global-only launches are
 #     excluded.
 #   - Variant rows are never generated as a Cartesian product.
@@ -416,11 +418,14 @@ def article_date(html):
 
 def get_release_window():
     """
-    Production: previous rolling 24 hours.
+    Production: previous 7 days (recovery window).
+
+    The 7-day overlap is intentional: if GitHub Actions misses a scheduled
+    run, launches are still discovered on the next successful run. The
+    canonical Excel duplicate key prevents re-inserting old variants.
 
     Test mode: set RETAILIX_TEST_DATE=YYYY-MM-DD to inspect one full
-    India calendar day without changing production behaviour.
-    Example: RETAILIX_TEST_DATE=2026-10-01
+    India calendar day.
     """
     test_date = os.getenv("RETAILIX_TEST_DATE", "").strip()
 
@@ -437,7 +442,7 @@ def get_release_window():
         return start, end, True
 
     end = now()
-    start = end - timedelta(hours=24)
+    start = end - timedelta(days=7)
     return start, end, False
 
 
@@ -548,6 +553,49 @@ NINETYONE_TEST_MAX_PAGES = 8
 NINETYONE_SEARCH_ARCHIVE = "https://www.91mobiles.com/hub/search/"
 
 
+LAUNCH_TITLE_HINTS = (
+    "launch", "launched", "launches", "unveil", "unveiled", "debut",
+    "goes official", "officially", "arrives in india", "india debut",
+    "available in india", "now on sale", "sale begins",
+)
+
+
+def title_looks_like_phone_launch(title):
+    """Broad discovery prefilter; final India-launch validation happens later."""
+    low = clean(title).lower()
+    has_launch_word = any(word in low for word in LAUNCH_TITLE_HINTS)
+    has_phone_or_brand = any(word in low for word in SMARTPHONE_TITLE_WORDS)
+    return has_launch_word and has_phone_or_brand
+
+
+def parse_91mobiles_feed(xml_text):
+    """Read recent article links from 91mobiles' own category RSS feed."""
+    out = []
+    if not xml_text:
+        return out
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return out
+    for item in root.iter():
+        if item.tag.rsplit("}", 1)[-1].lower() not in {"item", "entry"}:
+            continue
+        values = {}
+        for child in item:
+            tag = child.tag.rsplit("}", 1)[-1].lower()
+            if tag == "link":
+                values[tag] = child.attrib.get("href") or child.text or ""
+            elif tag in {"title", "pubdate", "published", "updated", "description", "summary"}:
+                values[tag] = child.text or ""
+        url = normalize_url(clean(values.get("link", "")), NINETYONE_CATEGORY_FEED)
+        title = clean(values.get("title", ""))
+        if not url or not title or "91mobiles.com" not in urlparse(url).netloc.lower():
+            continue
+        published = parse_rss_date(values.get("pubdate") or values.get("published") or values.get("updated"))
+        out.append({"title": title, "url": url, "published": published, "source": "91mobiles"})
+    return out
+
+
 def article_is_real_india_launch(title, body):
     """
     Verify that an article is actually reporting an India launch.
@@ -574,6 +622,12 @@ def article_is_real_india_launch(title, body):
         "available in india",
         "launched for the indian market",
         "now launched in india",
+        "made its india debut",
+        "made its debut in india",
+        "debuted in india",
+        "went official in india",
+        "is now official in india",
+        "now on sale in india",
     )
     return any(x in early for x in availability_words)
 
@@ -658,73 +712,63 @@ def parse_91mobiles_category(html):
 
 
 def direct_source_candidates(source, start, end, test_mode):
-    """Discover articles from 91mobiles only."""
+    """Discover candidate articles using only 91mobiles-owned surfaces.
+
+    Discovery combines the chronological category archive, the publisher's
+    RSS feed, and its on-site search for each supported brand. The same URL is
+    retained once. Candidate discovery is deliberately broad; the article
+    verifier remains the strict gate for an actual India launch and date.
+    """
     if source != "91mobiles":
         return []
 
     candidates = []
     seen = set()
 
-    # Historical test mode scans the 91mobiles archive because the requested
-    # date may be behind the current publisher homepage.
-    if test_mode:
-        max_pages = NINETYONE_TEST_MAX_PAGES
-        archive_start = start - timedelta(days=1)
-        for page in range(1, max_pages + 1):
-            # Use the actual 91mobiles Mobiles category archive for historical
-            # discovery. The old /hub/search/ URL is a search interface, not a
-            # chronological article archive, so its paginated pages can return
-            # no launch articles even while the category archive contains them.
-            url = (
-                NINETYONE_MOBILES_CATEGORY
-                if page == 1
-                else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
-            )
-            print(f"91mobiles archive scan: page {page}/{max_pages} | {url}")
-            # Listing pages are expected to be plain article indexes. Keep each
-            # request bounded so one slow page cannot consume the whole job.
-            html = get_html(url, timeout=12)
-            if not html:
-                print(f"91mobiles archive page unavailable: {page}")
+    def add_many(items):
+        for candidate in items:
+            url = candidate.get("url", "")
+            if not url or url in seen:
                 continue
-
-            page_candidates = parse_91mobiles_category(html)
-            print(f"91mobiles archive page {page}: {len(page_candidates)} article links")
-            page_dates = [
-                c["published"] for c in page_candidates
-                if c.get("published")
-            ]
-
-            for candidate in page_candidates:
-                if candidate["url"] in seen:
-                    continue
-                seen.add(candidate["url"])
-                candidates.append(candidate)
-
-            # Do not stop on listing-card dates: the page parser can pick up
-            # an unrelated date from a parent block and incorrectly make the
-            # archive look older than it is. Scan the configured historical
-            # limit; article publication dates are checked during verification.
-
-        print("91mobiles historical archive pages scanned:", page)
-        return candidates
-
-    for page in range(NINETYONE_MAX_PAGES):
-        url = (
-            NINETYONE_MOBILES_CATEGORY
-            if page == 0
-            else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
-        )
-        html = get_html(url, timeout=30)
-        if not html:
-            continue
-
-        for candidate in parse_91mobiles_category(html):
-            if candidate["url"] in seen:
-                continue
-            seen.add(candidate["url"])
+            seen.add(url)
             candidates.append(candidate)
 
+    max_pages = NINETYONE_TEST_MAX_PAGES if test_mode else NINETYONE_MAX_PAGES
+    for page in range(1, max_pages + 1):
+        url = (
+            NINETYONE_MOBILES_CATEGORY
+            if page == 1
+            else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
+        )
+        print(f"91mobiles archive scan: page {page}/{max_pages} | {url}")
+        html = get_html(url, timeout=18 if test_mode else 20)
+        if not html:
+            print(f"91mobiles archive page unavailable: {page}")
+            continue
+        page_candidates = parse_91mobiles_category(html)
+        print(f"91mobiles archive page {page}: {len(page_candidates)} article links")
+        add_many(page_candidates)
+
+    # Supplement archive pagination with 91mobiles' own RSS feed. This catches
+    # newly published articles that are omitted or delayed in category cards.
+    feed_xml = _get_http_text(NINETYONE_CATEGORY_FEED, timeout=15)
+    feed_candidates = parse_91mobiles_feed(feed_xml)
+    print("91mobiles RSS feed article links:", len(feed_candidates))
+    add_many(feed_candidates)
+
+    # Publisher on-site search is a second discovery route on the same domain.
+    # Search every configured brand, not just the brands seen in archive titles,
+    # so a missing archive card does not hide a launch article.
+    for brand in BRANDS:
+        search_url = NINETYONE_SEARCH_ARCHIVE + "?s=" + quote_plus(brand.lower())
+        html = get_html(search_url, timeout=15)
+        if not html:
+            continue
+        search_candidates = parse_91mobiles_category(html)
+        print(f"91mobiles on-site search {brand}: {len(search_candidates)} article links")
+        add_many(search_candidates)
+
+    print("91mobiles total unique article candidates:", len(candidates))
     return candidates
 
 def verify_publisher_article(candidate, brand, start, end, test_mode=False):
@@ -763,9 +807,7 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
     if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
         return None
 
-    title_has_phone = any(x in title_low for x in SMARTPHONE_TITLE_WORDS)
-    title_has_launch = any(x in title_low for x in STRONG_LAUNCH_WORDS)
-    if not (title_has_phone and title_has_launch):
+    if not title_looks_like_phone_launch(publisher_title):
         return None
 
     brand_from_article = detect_brand(publisher_title) or detect_brand(body[:15000])
@@ -819,20 +861,29 @@ def discover_source_candidates(source, start, end, test_mode):
         # verify_publisher_article(), which is the authoritative date gate.
         title = clean(candidate.get("title", ""))
         brand = detect_brand(title)
-        if not brand:
-            continue
 
-        # Avoid opening every unrelated article in the archive. This is only a
-        # discovery prefilter; the full article still has to pass all existing
-        # launch, India, brand, and date checks below.
-        title_low = title.lower()
-        title_has_phone = any(word in title_low for word in SMARTPHONE_TITLE_WORDS)
-        title_has_launch = any(word in title_low for word in STRONG_LAUNCH_WORDS)
-        if not (title_has_phone and title_has_launch):
+        # Keep the prefilter broad enough for titles that omit a brand name
+        # (for example, a model-family headline). The article body is checked
+        # for the brand before it can qualify, so this does not broaden the
+        # final accepted brand set.
+        if not title_looks_like_phone_launch(title):
             continue
 
         print(f"Checking 91mobiles launch article: {title[:100]}")
-        verified = verify_publisher_article(candidate, brand, start, end, test_mode)
+        verified = verify_publisher_article(candidate, brand, start, end, test_mode) if brand else None
+        if not verified:
+            # Brand may be absent from the card title but present in the actual
+            # article H1/body. Fetch once, detect the brand, then run the normal
+            # verifier against the same 91mobiles URL.
+            raw_html = get_html(candidate.get("url", ""), timeout=20)
+            if raw_html:
+                raw_soup = BeautifulSoup(raw_html, "html.parser")
+                raw_h1 = raw_soup.find("h1")
+                raw_title = clean(raw_h1.get_text(" ", strip=True)) if raw_h1 else title
+                raw_body = clean(raw_soup.get_text(" ", strip=True))
+                brand = detect_brand(raw_title) or detect_brand(raw_body[:15000])
+                if brand:
+                    verified = verify_publisher_article(candidate, brand, start, end, test_mode)
         if not verified:
             continue
 
@@ -2027,6 +2078,78 @@ def extract_variants(html, model):
     return found
 
 
+def extract_91mobiles_article_variants(article_html, model):
+    """Extract conservative RAM/storage/colour evidence from a verified launch article.
+
+    This is a cross-brand fallback only when the official India page does not
+    expose selectable SKUs. It accepts a colour list with a single explicit
+    RAM/storage configuration (all colours share that one configuration), or
+    exact colour/configuration pairs written together. It never cross-joins
+    multiple independent RAM/storage and colour lists.
+    """
+    if not article_html:
+        return []
+    soup = BeautifulSoup(article_html, "html.parser")
+    raw = soup.get_text(" ", strip=True)
+    text = clean(raw)
+    low = text.lower()
+
+    config_re = re.compile(
+        r"(?P<ram>(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
+        r"(?:\+|/)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
+        re.I,
+    )
+    configs = []
+    for match in config_re.finditer(text):
+        ram = normalize_capacity(match.group("ram"))
+        storage = normalize_capacity(match.group("storage"))
+        pair = (storage, ram)
+        if pair not in configs:
+            configs.append(pair)
+
+    color_candidates = []
+    color_patterns = (
+        r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)",
+        r"(?:colour|color)\s+options?\s*:?\s*([^.;]{3,140})",
+        r"available\s+in\s+([^.;]{3,140})",
+    )
+    for pattern in color_patterns:
+        for match in re.finditer(pattern, text, re.I):
+            segment = match.group(1)
+            # Remove common lead-in phrases and avoid capturing a whole sentence.
+            segment = re.sub(r"(?:the|two|three|multiple)\s+", "", segment, flags=re.I)
+            pieces = re.split(r",|and|or|\|", segment, flags=re.I)
+            for piece in pieces:
+                value = clean(piece).strip(" -:;,.()")
+                value = re.sub(r"(?:colour|color|option|variant)$", "", value, flags=re.I).strip()
+                if not value or len(value) > 35 or re.search(r"\d|(?:ram|gb|tb|storage|display|battery|camera|price|india)", value, re.I):
+                    continue
+                if len(value.split()) > 4:
+                    continue
+                if value.lower() not in {x.lower() for x in color_candidates}:
+                    color_candidates.append(value)
+
+    # Exact one-configuration articles can safely apply that configuration to
+    # each colour explicitly listed for the same handset.
+    if len(configs) == 1 and color_candidates:
+        storage, ram = configs[0]
+        return [(color, storage, ram) for color in color_candidates]
+
+    # For multi-configuration models, only accept a colour and configuration
+    # if both appear in a tight local phrase/window. No Cartesian products.
+    linked = []
+    for match in config_re.finditer(text):
+        left = text[max(0, match.start() - 90):match.start()]
+        right = text[match.end():min(len(text), match.end() + 90)]
+        context = left + " " + right
+        for color in color_candidates:
+            if re.search(r"" + re.escape(color) + r"", context, re.I):
+                item = (color, normalize_capacity(match.group("storage")), normalize_capacity(match.group("ram")))
+                if item not in linked:
+                    linked.append(item)
+    return linked
+
+
 # ------------------------------------------------------------
 # 91MOBILES PRIMARY IMAGE
 # ------------------------------------------------------------
@@ -2177,7 +2300,7 @@ def main():
     print("=" * 78)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
     print("DISCOVERY: 91MOBILES ONLY")
-    print("DATA: OFFICIAL INDIA BRAND WEBSITE")
+    print("DATA: OFFICIAL INDIA BRAND WEBSITE; 91MOBILES ARTICLE FALLBACK FOR EXPLICIT VARIANTS")
     print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
     print("=" * 78)
 
@@ -2209,7 +2332,7 @@ def main():
         )
     else:
         print(
-            f"24-HOUR INDIA RELEASE WINDOW: "
+            f"7-DAY RECOVERY WINDOW: "
             f"{start.isoformat()} -> {end.isoformat()}"
         )
 
@@ -2296,7 +2419,21 @@ def main():
             if oppo_specs_html:
                 print("Official OPPO specs fallback:", oppo_specs_url)
                 variants = extract_variants(oppo_specs_html, name)
-                if len(description) < 60:
+                # Cross-brand recovery: if an official product page is found but its
+        # SKU selector is not exposed to the crawler, use only explicit
+        # configuration evidence from the independently verified 91mobiles
+        # launch article. The parser rejects ambiguous multi-config matrices.
+        if not variants:
+            article_html = get_html(item.get("url", ""), timeout=20)
+            article_variants = extract_91mobiles_article_variants(article_html, name)
+            if article_variants:
+                variants = article_variants
+                print(
+                    "91mobiles article variant fallback (explicit evidence):",
+                    len(variants), "configuration(s)"
+                )
+
+        if len(description) < 60:
                     description = official_description(oppo_specs_html, name)
 
         # The OPPO India F35 specification page is official and explicitly
@@ -2459,6 +2596,20 @@ def main():
                     merged.append(candidate)
             variants = merged
             print("Official Infinix Smart 20 HD verified variants merged with page extraction:", len(variants))
+
+        # Cross-brand recovery: if an official product page is found but its
+        # SKU selector is not exposed to the crawler, use only explicit
+        # configuration evidence from the independently verified 91mobiles
+        # launch article. The parser rejects ambiguous multi-config matrices.
+        if not variants:
+            article_html = get_html(item.get("url", ""), timeout=20)
+            article_variants = extract_91mobiles_article_variants(article_html, name)
+            if article_variants:
+                variants = article_variants
+                print(
+                    "91mobiles article variant fallback (explicit evidence):",
+                    len(variants), "configuration(s)"
+                )
 
         if len(description) < 60:
             print("SKIPPED: official product description not verified.")
