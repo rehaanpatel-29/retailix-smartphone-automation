@@ -2137,7 +2137,7 @@ def extract_91mobiles_article_variants(article_html, model):
 
     config_re = re.compile(
         r"(?P<ram>\b(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
-        r"(?:\+|/)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
+        r"(?:\+|/|\band\b)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
         re.I,
     )
     configs = []
