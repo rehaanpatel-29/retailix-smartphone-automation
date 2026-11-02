@@ -526,6 +526,11 @@ EARLY_NEGATIVE_LAUNCH_WORDS = (
     "leaked",
     "coming soon",
     "will launch",
+    "to launch",
+    "launching in india on",
+    "launch set for",
+    "scheduled to launch",
+    "will be launched",
     "launch date confirmed",
 )
 
@@ -601,20 +606,38 @@ def parse_91mobiles_feed(xml_text):
 
 def article_is_real_india_launch(title, body):
     """
-    Verify that an article is actually reporting an India launch.
+    Verify a completed India launch.
 
-    We intentionally do NOT reject a whole article merely because the
-    body contains words such as 'announced earlier' or 'coming soon' for
-    another model. Only the headline / early article text controls the
-    launch classification, while the full article is used as evidence.
+    A clear completed-launch headline is itself valid publisher evidence;
+    the article body is then used for date/model context. Negative headline
+    wording still wins, so rumours and upcoming launches remain excluded.
     """
     title_low = clean(title).lower()
-    early = clean(body[:5000]).lower()
+    early = clean(body[:8000]).lower()
 
     if any(x in title_low for x in EARLY_NEGATIVE_LAUNCH_WORDS):
         return False
 
     if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
+        return False
+
+    # Completed launch wording in the actual 91mobiles H1 is strong evidence.
+    # Previously the verifier required a second exact phrase in the first
+    # 5,000 body characters. That rejected valid launch headlines when the
+    # article lead used different wording or included navigation text first.
+    completed_title_patterns = (
+        r"\b(?:launched|launches)\s+in\s+india\b",
+        r"\b(?:launched|launches)\s+in\s+the\s+indian\s+market\b",
+        r"\b(?:goes|went)\s+official\s+in\s+india\b",
+        r"\b(?:makes|made)\s+(?:its\s+)?india\s+debut\b",
+        r"\bdebuted\s+in\s+india\b",
+        r"\bnow\s+available\s+in\s+india\b",
+    )
+    if any(re.search(pattern, title_low) for pattern in completed_title_patterns):
+        return True
+
+    # A first-sale headline alone is not proof that the phone launched that day.
+    if "first sale" in title_low:
         return False
 
     if any(x in early for x in STRONG_LAUNCH_WORDS):
@@ -814,66 +837,78 @@ def direct_source_candidates(source, start, end, test_mode):
 
 def verify_publisher_article(candidate, brand, start, end, test_mode=False):
     url = candidate.get("url", "")
+    title = clean(candidate.get("title", ""))
     if not url:
+        print(f"REJECT [missing-url]: {title[:100]}")
         return None
 
-    title = candidate.get("title", "")
-    publisher_title = ""
-    body = ""
-    published = None
-
-    # Always verify the actual 91mobiles article directly.
-    # No second news source is required.
     html = get_html(url, timeout=30)
     if not html:
+        print(f"REJECT [article-fetch-failed]: {title[:100]} | {url}")
         return None
 
     soup = BeautifulSoup(html, "html.parser")
     body = clean(soup.get_text(" ", strip=True))
     h1 = soup.find("h1")
     publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
-    published = article_date(html) or candidate.get("published")
-
     if len(publisher_title) < 10:
         publisher_title = title
 
+    published = article_date(html) or candidate.get("published")
     if not published:
+        print(f"REJECT [publication-date-missing]: {publisher_title[:100]}")
         return None
 
     if not article_is_real_india_launch(publisher_title, body):
+        print(
+            f"REJECT [not-completed-india-launch]: {publisher_title[:100]} "
+            f"| published={published.date()}"
+        )
         return None
 
     title_low = publisher_title.lower()
-
     if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
+        print(f"REJECT [excluded-article-type]: {publisher_title[:100]}")
         return None
 
     if not title_looks_like_phone_launch(publisher_title):
+        print(f"REJECT [title-not-phone-launch]: {publisher_title[:100]}")
         return None
 
     brand_from_article = detect_brand(publisher_title) or detect_brand(body[:15000])
     if brand_from_article != brand:
+        print(
+            f"REJECT [brand-mismatch]: {publisher_title[:100]} "
+            f"| expected={brand!r} detected={brand_from_article!r}"
+        )
         return None
 
     launch_date = extract_launch_date_from_text(body, published)
-
-    # Never shift a launch date backwards merely because an article was
-    # published the following day. That can incorrectly assign an unrelated
-    # next-day story to the test date. Use an explicit launch date from the
-    # article when present; otherwise retain its publication date.
     if not (start <= launch_date <= end):
+        print(
+            f"REJECT [outside-date-window]: {publisher_title[:100]} "
+            f"| launch_date={launch_date.date()} "
+            f"| published={published.date()} "
+            f"| required={start.date()}..{end.date()}"
+        )
         return None
 
     model = normalize_model_name(publisher_title, brand)
     if not model or len(model) < 3:
+        print(f"REJECT [model-name-not-parsed]: {publisher_title[:100]}")
         return None
 
+    print(
+        f"VERIFIED [india-launch]: {brand} {model} "
+        f"| launch_date={launch_date.date()} "
+        f"| published={published.date()}"
+    )
     return {
         "brand": brand,
         "name": model,
         "release": launch_date,
         "url": url,
-        "source": candidate["source"],
+        "source": candidate.get("source", "91mobiles"),
         "article_date": published,
     }
 
