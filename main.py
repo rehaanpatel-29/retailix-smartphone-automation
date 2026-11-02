@@ -857,21 +857,10 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
 
     launch_date = extract_launch_date_from_text(body, published)
 
-    # A launch article can be published the day after the actual India launch.
-    # Historical test mode should still find that launch on its launch date,
-    # but only when the article itself confirms a real India launch and its
-    # publication date is exactly the following calendar day.
-    if test_mode:
-        target_day = start.date()
-        published_day = published.date()
-        if (
-            launch_date.date() != target_day
-            and published_day == target_day + timedelta(days=1)
-            and start <= datetime.combine(published_day, datetime.min.time(), tzinfo=IST) <= end + timedelta(days=1)
-            and article_is_real_india_launch(publisher_title, body)
-        ):
-            launch_date = end
-
+    # Never shift a launch date backwards merely because an article was
+    # published the following day. That can incorrectly assign an unrelated
+    # next-day story to the test date. Use an explicit launch date from the
+    # article when present; otherwise retain its publication date.
     if not (start <= launch_date <= end):
         return None
 
@@ -2149,6 +2138,44 @@ def extract_91mobiles_article_variants(article_html, model):
             configs.append(pair)
 
     color_candidates = []
+
+    # Some launch articles list colours in a simple sentence such as
+    # "It comes in Dark Blue, Green and Silver" without adding the word
+    # "colours". Accept that construction only when every comma/and-separated
+    # item contains a recognised colour word; this avoids treating arbitrary
+    # prose after "comes in" as colour names.
+    known_color_words = {
+        "black", "white", "blue", "green", "silver", "gray", "grey",
+        "gold", "purple", "violet", "pink", "red", "orange", "yellow",
+        "brown", "beige", "cream", "navy", "teal", "cyan", "magenta",
+        "titanium", "graphite", "midnight", "onyx", "lavender", "lilac",
+        "peach", "mint", "jade", "copper", "bronze", "rose", "ice",
+        "stardust", "aurora", "ocean", "sunset", "moonlight", "glacier",
+    }
+    simple_color_patterns = (
+        r"\bcomes\s+in\s+([^.;]{3,120})",
+        r"\bavailable\s+in\s+([^.;]{3,120})",
+        r"\boffered\s+in\s+([^.;]{3,120})",
+    )
+    for pattern in simple_color_patterns:
+        for match in re.finditer(pattern, text, re.I):
+            segment = match.group(1)
+            pieces = [
+                clean(x).strip(" -:;,.()")
+                for x in re.split(r",|\band\b|\bor\b|\|", segment, flags=re.I)
+            ]
+            pieces = [x for x in pieces if x]
+            if not pieces or len(pieces) > 5:
+                continue
+            piece_words = [
+                {w.lower() for w in re.findall(r"[A-Za-z]+", piece)}
+                for piece in pieces
+            ]
+            if all(words & known_color_words for words in piece_words):
+                for piece in pieces:
+                    if piece.lower() not in {x.lower() for x in color_candidates}:
+                        color_candidates.append(piece)
+
     color_patterns = (
         r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)\b",
         r"(?:colour|color)\s+options?\s*:?\s*([^.;]{3,140})",
@@ -2169,6 +2196,12 @@ def extract_91mobiles_article_variants(article_html, model):
                     continue
                 if value.lower() not in {x.lower() for x in color_candidates}:
                     color_candidates.append(value)
+
+    print(
+        "91mobiles article variant parser diagnostics:",
+        f"configs={len(configs)}",
+        f"colour_candidates={len(color_candidates)}",
+    )
 
     # Exact one-configuration articles can safely apply that configuration to
     # each colour explicitly listed for the same handset.
