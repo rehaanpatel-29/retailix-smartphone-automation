@@ -640,12 +640,20 @@ def extract_launch_date_from_text(text, fallback):
     text = clean(text)
 
     patterns = [
+        # Completed India-launch wording.
         r"(?:launched|launches|launch)\s+in\s+india\s+(?:on\s+)?"
         r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+20\d{2})",
         r"(?:launched|launches|launch)\s+in\s+india\s+(?:on\s+)?"
         r"([A-Za-z]+\s+\d{1,2},\s*20\d{2})",
         r"(?:launched|launches|launch)\s+in\s+india\s+(?:on\s+)?"
         r"(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2})",
+        # Explicit date labels used in 91mobiles launch and recap articles.
+        r"(?:india\s+launch(?:\s+date)?|launch\s+date\s+in\s+india)"
+        r"\s*(?:is|:|-|was|set\s+for|scheduled\s+for)?\s*"
+        r"([A-Za-z]+\s+\d{1,2},?\s+20\d{2})",
+        r"(?:india\s+launch(?:\s+date)?|launch\s+date\s+in\s+india)"
+        r"\s*(?:is|:|-|was|set\s+for|scheduled\s+for)?\s*"
+        r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+20\d{2})",
     ]
 
     for pattern in patterns:
@@ -2113,7 +2121,7 @@ def extract_91mobiles_article_variants(article_html, model):
     low = text.lower()
 
     config_re = re.compile(
-        r"(?P<ram>(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
+        r"(?P<ram>\b(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
         r"(?:\+|/)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
         re.I,
     )
@@ -2127,7 +2135,7 @@ def extract_91mobiles_article_variants(article_html, model):
 
     color_candidates = []
     color_patterns = (
-        r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)",
+        r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)\b",
         r"(?:colour|color)\s+options?\s*:?\s*([^.;]{3,140})",
         r"available\s+in\s+([^.;]{3,140})",
     )
@@ -2135,12 +2143,12 @@ def extract_91mobiles_article_variants(article_html, model):
         for match in re.finditer(pattern, text, re.I):
             segment = match.group(1)
             # Remove common lead-in phrases and avoid capturing a whole sentence.
-            segment = re.sub(r"(?:the|two|three|multiple)\s+", "", segment, flags=re.I)
-            pieces = re.split(r",|and|or|\|", segment, flags=re.I)
+            segment = re.sub(r"\b(?:the|two|three|multiple)\s+", "", segment, flags=re.I)
+            pieces = re.split(r",|\band\b|\bor\b|\|", segment, flags=re.I)
             for piece in pieces:
                 value = clean(piece).strip(" -:;,.()")
-                value = re.sub(r"(?:colour|color|option|variant)$", "", value, flags=re.I).strip()
-                if not value or len(value) > 35 or re.search(r"\d|(?:ram|gb|tb|storage|display|battery|camera|price|india)", value, re.I):
+                value = re.sub(r"\b(?:colour|color|option|variant)$", "", value, flags=re.I).strip()
+                if not value or len(value) > 35 or re.search(r"\d|\b(?:ram|gb|tb|storage|display|battery|camera|price|india)\b", value, re.I):
                     continue
                 if len(value.split()) > 4:
                     continue
@@ -2161,7 +2169,7 @@ def extract_91mobiles_article_variants(article_html, model):
         right = text[match.end():min(len(text), match.end() + 90)]
         context = left + " " + right
         for color in color_candidates:
-            if re.search(r"" + re.escape(color) + r"", context, re.I):
+            if re.search(r"\b" + re.escape(color) + r"\b", context, re.I):
                 item = (color, normalize_capacity(match.group("storage")), normalize_capacity(match.group("ram")))
                 if item not in linked:
                     linked.append(item)
