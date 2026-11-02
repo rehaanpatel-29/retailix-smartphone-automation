@@ -631,6 +631,14 @@ def article_is_real_india_launch(title, body):
         "went official in india",
         "is now official in india",
         "now on sale in india",
+        "has gone on sale in india",
+        "has now gone on sale in india",
+        "goes on sale in india",
+        "first sale begins in india",
+        "first sale starts in india",
+        "sale starts in india",
+        "is now available to buy in india",
+        "available to purchase in india",
     )
     return any(x in early for x in availability_words)
 
@@ -647,6 +655,13 @@ def extract_launch_date_from_text(text, fallback):
         r"([A-Za-z]+\s+\d{1,2},\s*20\d{2})",
         r"(?:launched|launches|launch)\s+in\s+india\s+(?:on\s+)?"
         r"(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2})",
+        # Past-tense variants used in follow-up/first-sale articles.
+        r"(?:was|were)\s+launched\s+(?:in\s+india\s+)?(?:on\s+)?"
+        r"([A-Za-z]+\s+\d{1,2},?\s+20\d{2})",
+        r"(?:was|were)\s+launched\s+(?:in\s+india\s+)?(?:on\s+)?"
+        r"(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+20\d{2})",
+        r"(?:india\s+launch(?:ed)?\s+(?:on|date(?:d)?\s*(?:is|was|:)?))\s*"
+        r"([A-Za-z]+\s+\d{1,2},?\s+20\d{2})",
         # Explicit date labels used in 91mobiles launch and recap articles.
         r"(?:india\s+launch(?:\s+date)?|launch\s+date\s+in\s+india)"
         r"\s*(?:is|:|-|was|set\s+for|scheduled\s+for)?\s*"
@@ -2445,21 +2460,7 @@ def main():
             if oppo_specs_html:
                 print("Official OPPO specs fallback:", oppo_specs_url)
                 variants = extract_variants(oppo_specs_html, name)
-                # Cross-brand recovery: if an official product page is found but its
-        # SKU selector is not exposed to the crawler, use only explicit
-        # configuration evidence from the independently verified 91mobiles
-        # launch article. The parser rejects ambiguous multi-config matrices.
-        if not variants:
-            article_html = get_html(item.get("url", ""), timeout=20)
-            article_variants = extract_91mobiles_article_variants(article_html, name)
-            if article_variants:
-                variants = article_variants
-                print(
-                    "91mobiles article variant fallback (explicit evidence):",
-                    len(variants), "configuration(s)"
-                )
-
-        if len(description) < 60:
+                if len(description) < 60:
                     description = official_description(oppo_specs_html, name)
 
         # The OPPO India F35 specification page is official and explicitly
