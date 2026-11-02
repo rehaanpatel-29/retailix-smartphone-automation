@@ -2130,7 +2130,7 @@ def extract_91mobiles_article_variants(article_html, model):
     low = text.lower()
 
     config_re = re.compile(
-        r"(?P<ram>(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
+        r"(?P<ram>\b(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
         r"(?:\+|/)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
         re.I,
     )
@@ -2144,20 +2144,19 @@ def extract_91mobiles_article_variants(article_html, model):
 
     color_candidates = []
     color_patterns = (
-        r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)",
+        r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)\b",
         r"(?:colour|color)\s+options?\s*:?\s*([^.;]{3,140})",
-        r"available\s+in\s+([^.;]{3,140})",
     )
     for pattern in color_patterns:
         for match in re.finditer(pattern, text, re.I):
             segment = match.group(1)
             # Remove common lead-in phrases and avoid capturing a whole sentence.
-            segment = re.sub(r"(?:the|two|three|multiple)\s+", "", segment, flags=re.I)
-            pieces = re.split(r",|and|or|\|", segment, flags=re.I)
+            segment = re.sub(r"\b(?:the|two|three|multiple)\s+", "", segment, flags=re.I)
+            pieces = re.split(r",|\band\b|\bor\b|\|", segment, flags=re.I)
             for piece in pieces:
                 value = clean(piece).strip(" -:;,.()")
-                value = re.sub(r"(?:colour|color|option|variant)$", "", value, flags=re.I).strip()
-                if not value or len(value) > 35 or re.search(r"\d|(?:ram|gb|tb|storage|display|battery|camera|price|india)", value, re.I):
+                value = re.sub(r"\b(?:colou?rs?|option|variant)$", "", value, flags=re.I).strip()
+                if not value or len(value) > 35 or re.search(r"\d|\b(?:ram|gb|tb|storage|display|battery|camera|price|india)\b", value, re.I):
                     continue
                 if len(value.split()) > 4:
                     continue
@@ -2170,20 +2169,33 @@ def extract_91mobiles_article_variants(article_html, model):
         storage, ram = configs[0]
         return [(color, storage, ram) for color in color_candidates]
 
-    # For multi-configuration models, only accept a colour and configuration
-    # if both appear in a tight local phrase/window. No Cartesian products.
+    # For multi-configuration models, accept a colour/configuration pair only
+    # when both occur in the same sentence. A nearby paragraph-level colour
+    # list must never be cross-joined with multiple RAM/storage options.
     linked = []
+    sentence_spans = []
+    start = 0
+    for boundary in re.finditer(r"[.!?;]", text):
+        sentence_spans.append((start, boundary.start(), text[start:boundary.start()]))
+        start = boundary.end()
+    sentence_spans.append((start, len(text), text[start:]))
+
     for match in config_re.finditer(text):
-        left = text[max(0, match.start() - 90):match.start()]
-        right = text[match.end():min(len(text), match.end() + 90)]
-        context = left + " " + right
+        sentence = next(
+            (segment for left, right, segment in sentence_spans
+             if left <= match.start() < right),
+            "",
+        )
         for color in color_candidates:
-            if re.search(r"" + re.escape(color) + r"", context, re.I):
-                item = (color, normalize_capacity(match.group("storage")), normalize_capacity(match.group("ram")))
+            if re.search(r"\\b" + re.escape(color) + r"\\b", sentence, re.I):
+                item = (
+                    color,
+                    normalize_capacity(match.group("storage")),
+                    normalize_capacity(match.group("ram")),
+                )
                 if item not in linked:
                     linked.append(item)
     return linked
-
 
 # ------------------------------------------------------------
 # 91MOBILES PRIMARY IMAGE
