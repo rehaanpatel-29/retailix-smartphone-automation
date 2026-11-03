@@ -851,20 +851,9 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
 
     launch_date = extract_launch_date_from_text(body, published)
 
-    # A launch article can be published the day after the actual India launch.
-    # Historical test mode should still find that launch on its launch date,
-    # but only when the article itself confirms a real India launch and its
-    # publication date is exactly the following calendar day.
-    if test_mode:
-        target_day = start.date()
-        published_day = published.date()
-        if (
-            launch_date.date() != target_day
-            and published_day == target_day + timedelta(days=1)
-            and start <= datetime.combine(published_day, datetime.min.time(), tzinfo=IST) <= end + timedelta(days=1)
-            and article_is_real_india_launch(publisher_title, body)
-        ):
-            launch_date = end
+    # Keep the article's explicit India launch date (or its publication date
+    # when no launch date is stated). Never backdate a next-day article merely
+    # because it reports an India launch: that can assign the wrong launch day.
 
     if not (start <= launch_date <= end):
         return None
@@ -2131,7 +2120,7 @@ def extract_91mobiles_article_variants(article_html, model):
 
     config_re = re.compile(
         r"(?P<ram>\b(?:2|3|4|6|8|12|16|18|24|32)\s*GB)\s*(?:RAM)?\s*"
-        r"(?:\+|/)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
+        r"(?:\+|/|,|and)\s*(?P<storage>\d{2,4}\s*(?:GB|TB))",
         re.I,
     )
     configs = []
@@ -2144,7 +2133,9 @@ def extract_91mobiles_article_variants(article_html, model):
 
     color_candidates = []
     color_patterns = (
-        r"(?:comes|available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)\b",
+        # Common launch-article wording: "It comes in Dark Blue, Green and Silver."
+        r"\bcomes\s+in\s+([^.;]{3,140})",
+        r"(?:available|offered|launches|launched)\s+in\s+([^.;]{3,140}?)\s+(?:colou?rs?|colourways?|variants?)\b",
         r"(?:colour|color)\s+options?\s*:?\s*([^.;]{3,140})",
     )
     for pattern in color_patterns:
@@ -2187,7 +2178,7 @@ def extract_91mobiles_article_variants(article_html, model):
             "",
         )
         for color in color_candidates:
-            if re.search(r"\\b" + re.escape(color) + r"\\b", sentence, re.I):
+            if re.search(r"\b" + re.escape(color) + r"\b", sentence, re.I):
                 item = (
                     color,
                     normalize_capacity(match.group("storage")),
@@ -2455,21 +2446,22 @@ def main():
                     len(variants),
                 )
 
-        # Some official OPPO product landing pages expose the marketing
-        # content but do not expose the complete RAM/ROM selector data in the
-        # HTML returned to GitHub Actions. For OPPO F35 series, use the
-        # official India specifications page as a second official source for
-        # the same product family. This is NOT a news-site fallback.
+        # Some official OPPO product landing pages expose marketing content
+        # without the complete RAM/ROM selector. Use the official India specs
+        # page for this exact model as a second official source.
         if not variants and brand.upper() == "OPPO" and "f35" in model.lower():
             oppo_specs_url = "https://www.oppo.com/in/smartphones/series-f/f35-5g/specs/"
             oppo_specs_html = get_html(oppo_specs_url, timeout=30)
             if oppo_specs_html:
                 print("Official OPPO specs fallback:", oppo_specs_url)
                 variants = extract_variants(oppo_specs_html, name)
-                # Cross-brand recovery: if an official product page is found but its
-        # SKU selector is not exposed to the crawler, use only explicit
-        # configuration evidence from the independently verified 91mobiles
-        # launch article. The parser rejects ambiguous multi-config matrices.
+                if len(description) < 60:
+                    description = official_description(oppo_specs_html, name)
+
+        # Cross-brand recovery: when the official India product page has no
+        # parseable selector, use only explicit configuration evidence from
+        # this independently verified 91mobiles launch article. The parser
+        # refuses ambiguous multi-configuration colour/capacity combinations.
         if not variants:
             article_html = get_html(item.get("url", ""), timeout=20)
             article_variants = extract_91mobiles_article_variants(article_html, name)
@@ -2479,9 +2471,6 @@ def main():
                     "91mobiles article variant fallback (explicit evidence):",
                     len(variants), "configuration(s)"
                 )
-
-        if len(description) < 60:
-                    description = official_description(oppo_specs_html, name)
 
         # The OPPO India F35 specification page is official and explicitly
         # lists the F35 configurations and colours, but the selector matrix
