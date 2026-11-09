@@ -383,8 +383,22 @@ def date_only(dt):
     return dt.date() if dt else None
 
 def article_date(html):
+    """Extract a publisher date from metadata, JSON-LD, or visible time tags."""
     soup = BeautifulSoup(html, "html.parser")
 
+    def parse_value(value):
+        if not value:
+            return None
+        value = clean(value)
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=IST)
+            return dt.astimezone(IST)
+        except (TypeError, ValueError, OverflowError):
+            return parse_date(value)
+
+    # Standard publisher metadata.
     for attrs in (
         {"property": "article:published_time"},
         {"property": "og:article:published_time"},
@@ -392,54 +406,99 @@ def article_date(html):
         {"name": "date"},
         {"itemprop": "datePublished"},
     ):
-        m = soup.find("meta", attrs=attrs)
-        if m:
-            value = m.get("content") or m.get("datetime")
-            if value:
-                try:
-                    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=IST)
-                    return dt.astimezone(IST)
-                except ValueError:
-                    parsed = parse_date(value)
-                    if parsed:
-                        return parsed
+        tag = soup.find("meta", attrs=attrs)
+        if tag:
+            parsed = parse_value(tag.get("content") or tag.get("datetime"))
+            if parsed:
+                return parsed
+
+    # 91mobiles and other publishers may expose the date only in JSON-LD.
+    json_dates = {"published": [], "created": [], "modified": []}
+
+    def walk_json(value):
+        if isinstance(value, dict):
+            for key, bucket in (
+                ("datePublished", "published"),
+                ("dateCreated", "created"),
+                ("dateModified", "modified"),
+            ):
+                parsed = parse_value(value.get(key))
+                if parsed:
+                    json_dates[bucket].append(parsed)
+            for child in value.values():
+                walk_json(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk_json(child)
+
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        raw = tag.string or tag.get_text(" ", strip=True)
+        if not raw or len(raw) > 1_000_000:
+            continue
+        try:
+            walk_json(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+    for bucket in ("published", "created", "modified"):
+        if json_dates[bucket]:
+            return json_dates[bucket][0]
 
     for tag in soup.find_all("time"):
-        value = tag.get("datetime") or tag.get_text(" ", strip=True)
-        parsed = parse_date(value)
+        parsed = parse_value(tag.get("datetime") or tag.get_text(" ", strip=True))
         if parsed:
             return parsed
 
-    return None
+    # Only parse explicitly labelled publication text; do not grab arbitrary
+    # dates from related stories or specification tables.
+    page_text = clean(soup.get_text(" ", strip=True))
+    match = re.search(
+        r"(?:published|posted)\s*(?:on|:)?\s*"
+        r"(\d{1,2}\s+[A-Za-z]{3,9},?\s+20\d{2}|"
+        r"[A-Za-z]+\s+\d{1,2},?\s+20\d{2}|"
+        r"20\d{2}-\d{1,2}-\d{1,2})",
+        page_text,
+        re.I,
+    )
+    return parse_value(match.group(1)) if match else None
 
 
 
 def get_release_window():
-    """
-    Production: previous 7 days (recovery window).
+    """Use a rolling 7-day production window; allow explicit recent-day tests.
 
-    The 7-day overlap is intentional: if GitHub Actions misses a scheduled
-    run, launches are still discovered on the next successful run. The
-    canonical Excel duplicate key prevents re-inserting old variants.
-
-    Test mode: set RETAILIX_TEST_DATE=YYYY-MM-DD to inspect one full
-    India calendar day.
+    A stale RETAILIX_TEST_DATE was accidentally left enabled in repeated
+    workflow runs. Dates older than the rolling recovery window are therefore
+    ignored unless RETAILIX_ALLOW_HISTORICAL_TEST=1 is explicitly set.
     """
     test_date = os.getenv("RETAILIX_TEST_DATE", "").strip()
+    allow_historical = os.getenv("RETAILIX_ALLOW_HISTORICAL_TEST", "").strip().lower() in {
+        "1", "true", "yes"
+    }
 
     if test_date:
         try:
             day = datetime.strptime(test_date, "%Y-%m-%d").date()
         except ValueError as exc:
             raise RuntimeError(
-                "RETAILIX_TEST_DATE must use YYYY-MM-DD, e.g. 2026-10-01"
+                "RETAILIX_TEST_DATE must use YYYY-MM-DD, e.g. 2026-11-09"
             ) from exc
 
-        start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
-        end = start + timedelta(days=1) - timedelta(microseconds=1)
-        return start, end, True
+        today = now().date()
+        oldest_allowed = today - timedelta(days=7)
+        if day < oldest_allowed and not allow_historical:
+            print(
+                "WARNING: ignoring stale RETAILIX_TEST_DATE=" + test_date
+                + f" (today={today}; older than the 7-day recovery window)."
+            )
+            print(
+                "For an intentional historical test only, set "
+                "RETAILIX_ALLOW_HISTORICAL_TEST=1."
+            )
+        else:
+            start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
+            end = start + timedelta(days=1) - timedelta(microseconds=1)
+            return start, end, True
 
     end = now()
     start = end - timedelta(days=7)
@@ -634,6 +693,12 @@ def article_is_real_india_launch(title, body):
     if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
         return False
 
+    # The publisher's own headline is direct evidence. Do not require the
+    # same phrase to appear again in the first 5,000 characters of page text:
+    # navigation, related-story blocks, and page chrome can precede the body.
+    if any(x in title_low for x in STRONG_LAUNCH_WORDS):
+        return True
+
     if any(x in early for x in STRONG_LAUNCH_WORDS):
         return True
 
@@ -808,68 +873,75 @@ def direct_source_candidates(source, start, end, test_mode):
 
 def verify_publisher_article(candidate, brand, start, end, test_mode=False):
     url = candidate.get("url", "")
-    if not url:
+    title = clean(candidate.get("title", ""))
+
+    def reject(reason):
+        print(f"  REJECTED [{reason}]: {title[:90]} | {url}")
         return None
 
-    title = candidate.get("title", "")
-    publisher_title = ""
-    body = ""
-    published = None
+    if not url:
+        return reject("missing article URL")
 
-    # Always verify the actual 91mobiles article directly.
-    # No second news source is required.
     html = get_html(url, timeout=30)
     if not html:
-        return None
+        return reject("article fetch returned no HTML")
 
     soup = BeautifulSoup(html, "html.parser")
     body = clean(soup.get_text(" ", strip=True))
     h1 = soup.find("h1")
     publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
-    published = article_date(html) or candidate.get("published")
-
     if len(publisher_title) < 10:
         publisher_title = title
 
-    if not published:
-        return None
+    published = article_date(html) or candidate.get("published")
 
     if not article_is_real_india_launch(publisher_title, body):
-        return None
+        return reject("headline/body does not confirm a completed India launch")
 
-    title_low = publisher_title.lower()
-
-    if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
-        return None
+    if any(x in publisher_title.lower() for x in ARTICLE_EXCLUDE_WORDS):
+        return reject("excluded headline type (review/deal/variant update)")
 
     if not title_looks_like_phone_launch(publisher_title):
-        return None
+        return reject("publisher headline failed phone-launch title filter")
 
     brand_from_article = detect_brand(publisher_title) or detect_brand(body[:15000])
     if brand_from_article != brand:
-        return None
+        return reject(
+            f"brand mismatch: expected={brand!r}, article={brand_from_article!r}"
+        )
 
-    launch_date = extract_launch_date_from_text(body, published)
-
-    # Keep the article's explicit India launch date (or its publication date
-    # when no launch date is stated). Never backdate a next-day article merely
-    # because it reports an India launch: that can assign the wrong launch day.
+    # Prefer an explicitly stated India launch date. Publication date is the
+    # fallback only when the article does not state a launch date.
+    explicit_launch_date = extract_launch_date_from_text(body, None)
+    launch_date = explicit_launch_date or published
+    if not launch_date:
+        return reject("no publication date or explicit India launch date found")
 
     if not (start <= launch_date <= end):
-        return None
+        return reject(
+            f"launch date outside window: parsed={launch_date.isoformat()}, "
+            f"window={start.isoformat()}..{end.isoformat()}, "
+            f"published={published.isoformat() if published else 'not found'}"
+        )
 
     model = normalize_model_name(publisher_title, brand)
     if not model or len(model) < 3:
-        return None
+        return reject("model name could not be normalized")
 
+    article_date_value = published or launch_date
+    print(
+        f"  VERIFIED: {brand} {model} | launch={launch_date.date()} | "
+        f"published={article_date_value.date()}"
+    )
     return {
         "brand": brand,
         "name": model,
         "release": launch_date,
         "url": url,
-        "source": candidate["source"],
-        "article_date": published,
+        "source": candidate.get("source", "91mobiles"),
+        "article_date": article_date_value,
     }
+
 
 
 def discover_source_candidates(source, start, end, test_mode):
@@ -909,6 +981,8 @@ def discover_source_candidates(source, start, end, test_mode):
                 if brand:
                     verified = verify_publisher_article(candidate, brand, start, end, test_mode)
         if not verified:
+            if not brand:
+                print(f"  REJECTED [brand not detected from headline]: {title[:100]}")
             continue
 
         key = (brand, model_key(verified["name"]))
@@ -2389,7 +2463,7 @@ def main():
             )
         else:
             print("\nNo selected-brand phone was verified by 91mobiles")
-            print("in the last 24 hours.")
+            print("in the rolling 7-day recovery window.")
         print("AUTOMATION COMPLETED - NO EXCEL CHANGES.")
         return
 
