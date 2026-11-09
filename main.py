@@ -80,6 +80,15 @@ SELECTED_BRANDS_LOWER = {
     for brand, aliases in BRAND_ALIASES.items()
 }
 
+# Keep GitHub Actions output clean by default. Set RETAILIX_VERBOSE=1
+# in repository variables only when detailed diagnostics are needed.
+VERBOSE_LOGS = os.getenv("RETAILIX_VERBOSE", "0").strip() == "1"
+
+def debug_log(message):
+    if VERBOSE_LOGS:
+        print(message)
+
+
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": (
@@ -132,7 +141,7 @@ def _looks_like_js_commerce_page(url, html):
 
 def _render_page_with_browser(url, timeout=30):
     if not PLAYWRIGHT_AVAILABLE:
-        print(
+        debug_log(
             f"Browser render unavailable for {url}: Playwright is not installed "
             "or failed to import. Check the GitHub Actions install step."
         )
@@ -171,7 +180,7 @@ def _render_page_with_browser(url, timeout=30):
                     "this page isn’t available", "this page isn't available",
                 )
                 if any(marker in early_title for marker in error_markers):
-                    print(
+                    debug_log(
                         f"Browser fast-fail: error page title={early_title[:100]!r} "
                         f"url={url}"
                     )
@@ -274,9 +283,9 @@ def _get_http_text(url, timeout=15):
         response = SESSION.get(url, timeout=timeout, allow_redirects=True)
         if response.ok:
             return response.text or ""
-        print(f"HTTP resource unavailable: status={response.status_code} url={url}")
+        debug_log(f"HTTP resource unavailable: status={response.status_code} url={url}")
     except requests.RequestException as exc:
-        print(f"HTTP resource request failed: url={url} error={exc}")
+        debug_log(f"HTTP resource request failed: url={url} error={exc}")
     return ""
 
 
@@ -289,7 +298,7 @@ def get_html(url, timeout=30):
         # For known JS-heavy commerce pages, prefer the rendered DOM when it
         # contains useful content. Rendering remains page-specific.
         if rendered and len(rendered) > 300:
-            print(f"Rendered official JS page: {url}")
+            debug_log(f"Rendered official JS page: {url}")
             return rendered
 
     if html and len(html) > 300:
@@ -519,9 +528,15 @@ def detect_brand(text):
 
 def normalize_model_name(name, brand=None):
     name = clean(name)
+    name = re.sub(r"^\[[^]]+\]\s*", "", name)
 
     name = re.split(
         r"\b(?:launched|launches|unveiled|debuts|introduced|arrives)\b",
+        name, maxsplit=1, flags=re.I,
+    )[0]
+    name = re.split(
+        r"\b(?:goes official|is official|bags|receives|spotted|tipped|"
+        r"design revealed|specifications revealed|launch imminent)\b",
         name, maxsplit=1, flags=re.I,
     )[0]
     name = re.split(
@@ -675,46 +690,91 @@ def parse_91mobiles_feed(xml_text):
     return out
 
 
-def article_is_real_india_launch(title, body):
+def extract_91mobiles_article_text(soup):
     """
-    Verify that an article is actually reporting an India launch.
+    Extract the article body without site navigation, related stories,
+    recommendation widgets, comments, or footer text. Page-wide text caused
+    false positives because unrelated launch headlines appeared in widgets.
+    """
+    selectors = (
+        "article .entry-content", ".entry-content",
+        "article .post-content", ".post-content",
+        "article .article-content", ".article-content",
+        "article .content", "article",
+    )
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if not node:
+            continue
+        clone = BeautifulSoup(str(node), "html.parser")
+        for unwanted in clone.select(
+            "script,style,nav,header,footer,aside,form,"
+            ".related,.related-posts,.related-articles,"
+            ".recommended,.recommendation,.popular-posts,"
+            ".social-share,.comments,.comment"
+        ):
+            unwanted.decompose()
+        text = clean(clone.get_text(" ", strip=True))
+        if len(text) >= 250:
+            return text
 
-    We intentionally do NOT reject a whole article merely because the
-    body contains words such as 'announced earlier' or 'coming soon' for
-    another model. Only the headline / early article text controls the
-    launch classification, while the full article is used as evidence.
+    # Fallback is used only as content evidence, never as a standalone
+    # positive signal unless the exact model is tied to an India launch claim.
+    return clean(soup.get_text(" ", strip=True))
+
+
+def article_is_real_india_launch(title, article_text, model=None):
+    """
+    Accept only completed India launches for the specific model.
+    Do not use page-wide related-story text as launch evidence.
     """
     title_low = clean(title).lower()
-    early = clean(body[:5000]).lower()
+    content = clean(article_text).lower()
 
-    if any(x in title_low for x in EARLY_NEGATIVE_LAUNCH_WORDS):
-        return False
-
-    if any(x in title_low for x in ARTICLE_EXCLUDE_WORDS):
-        return False
-
-    # The publisher's own headline is direct evidence. Do not require the
-    # same phrase to appear again in the first 5,000 characters of page text:
-    # navigation, related-story blocks, and page chrome can precede the body.
-    if any(x in title_low for x in STRONG_LAUNCH_WORDS):
-        return True
-
-    if any(x in early for x in STRONG_LAUNCH_WORDS):
-        return True
-
-    availability_words = (
-        "now available in india",
-        "available in india",
-        "launched for the indian market",
-        "now launched in india",
-        "made its india debut",
-        "made its debut in india",
-        "debuted in india",
-        "went official in india",
-        "is now official in india",
-        "now on sale in india",
+    negative_title_signals = (
+        "tipped", "leaked", "rumour", "rumor", "could launch",
+        "may launch", "might launch", "expected to launch",
+        "set to launch", "launch imminent", "launch appears to be",
+        "in the works", "certification", "bags 3c", "bags bis",
+        "design revealed", "specifications revealed",
+        "launch date confirmed", "coming soon", "will launch",
     )
-    return any(x in early for x in availability_words)
+    if any(term in title_low for term in negative_title_signals):
+        return False
+
+    if any(term in title_low for term in ARTICLE_EXCLUDE_WORDS):
+        return False
+
+    # Strongest evidence: the article headline itself says the phone has
+    # launched in India (not merely that a launch is planned).
+    headline_positive = (
+        "launched in india", "launches in india",
+        "launched for the indian market", "debuted in india",
+        "made its india debut", "arrives in india",
+        "goes official in india", "now available in india",
+        "available in india now",
+    )
+    if any(term in title_low for term in headline_positive):
+        return True
+
+    # Otherwise require the exact model name and a completed-launch phrase
+    # close together in the actual article content. Never accept a generic
+    # "launched in India" phrase from a related-story card.
+    if model:
+        model_norm = re.sub(r"[^a-z0-9]+", " ", clean(model).lower()).strip()
+        content_norm = re.sub(r"[^a-z0-9]+", " ", content)
+        if model_norm:
+            pos = content_norm.find(model_norm)
+            if pos >= 0:
+                context = content_norm[max(0, pos - 250):pos + len(model_norm) + 500]
+                completed = (
+                    "launched in india", "has launched in india",
+                    "launches in india", "launched for the indian market",
+                    "debuted in india", "made its india debut",
+                    "went official in india",
+                )
+                return any(term in context for term in completed)
+    return False
 
 
 def extract_launch_date_from_text(text, fallback):
@@ -825,20 +885,20 @@ def direct_source_candidates(source, start, end, test_mode):
             if page == 1
             else f"{NINETYONE_MOBILES_CATEGORY}page/{page}/"
         )
-        print(f"91mobiles archive scan: page {page}/{max_pages} | {url}")
+        debug_log(f"91mobiles archive scan: page {page}/{max_pages} | {url}")
         html = get_html(url, timeout=18 if test_mode else 20)
         if not html:
-            print(f"91mobiles archive page unavailable: {page}")
+            debug_log(f"91mobiles archive page unavailable: {page}")
             continue
         page_candidates = parse_91mobiles_category(html)
-        print(f"91mobiles archive page {page}: {len(page_candidates)} article links")
+        debug_log(f"91mobiles archive page {page}: {len(page_candidates)} article links")
         add_many(page_candidates)
 
     # Supplement archive pagination with 91mobiles' own RSS feed. This catches
     # newly published articles that are omitted or delayed in category cards.
     feed_xml = _get_http_text(NINETYONE_CATEGORY_FEED, timeout=15)
     feed_candidates = parse_91mobiles_feed(feed_xml)
-    print("91mobiles RSS feed article links:", len(feed_candidates))
+    debug_log("91mobiles RSS feed article links: " + str(len(feed_candidates)))
     add_many(feed_candidates)
 
     # Publisher on-site search is a second discovery route on the same domain.
@@ -854,21 +914,21 @@ def direct_source_candidates(source, start, end, test_mode):
             search_url = NINETYONE_SEARCH_ARCHIVE + "?s=" + quote_plus(query)
             html = get_html(search_url, timeout=15)
             if not html:
-                print(f"91mobiles on-site search unavailable: {brand} | {query}")
+                debug_log(f"91mobiles on-site search unavailable: {brand} | {query}")
                 continue
             search_candidates = parse_91mobiles_category(html)
             launch_candidates = [
                 item for item in search_candidates
                 if title_looks_like_phone_launch(item.get("title", ""))
             ]
-            print(
+            debug_log(
                 f"91mobiles on-site search {brand} [{query}]: "
                 f"{len(search_candidates)} links, "
                 f"{len(launch_candidates)} launch-title candidates"
             )
             add_many(launch_candidates)
 
-    print("91mobiles total unique article candidates:", len(candidates))
+    print(f"Discovery scan complete: {len(candidates)} unique articles reviewed.")
     return candidates
 
 def verify_publisher_article(candidate, brand, start, end, test_mode=False):
@@ -876,7 +936,7 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
     title = clean(candidate.get("title", ""))
 
     def reject(reason):
-        print(f"  REJECTED [{reason}]: {title[:90]} | {url}")
+        debug_log(f"  Rejected [{reason}]: {title[:90]} | {url}")
         return None
 
     if not url:
@@ -887,16 +947,17 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
         return reject("article fetch returned no HTML")
 
     soup = BeautifulSoup(html, "html.parser")
-    body = clean(soup.get_text(" ", strip=True))
     h1 = soup.find("h1")
     publisher_title = clean(h1.get_text(" ", strip=True)) if h1 else title
     if len(publisher_title) < 10:
         publisher_title = title
 
+    article_text = extract_91mobiles_article_text(soup)
     published = article_date(html) or candidate.get("published")
 
-    if not article_is_real_india_launch(publisher_title, body):
-        return reject("headline/body does not confirm a completed India launch")
+    model = normalize_model_name(publisher_title, brand)
+    if not article_is_real_india_launch(publisher_title, article_text, model):
+        return reject("article does not prove a completed India launch for this exact model")
 
     if any(x in publisher_title.lower() for x in ARTICLE_EXCLUDE_WORDS):
         return reject("excluded headline type (review/deal/variant update)")
@@ -904,7 +965,7 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
     if not title_looks_like_phone_launch(publisher_title):
         return reject("publisher headline failed phone-launch title filter")
 
-    brand_from_article = detect_brand(publisher_title) or detect_brand(body[:15000])
+    brand_from_article = detect_brand(publisher_title) or detect_brand(article_text[:15000])
     if brand_from_article != brand:
         return reject(
             f"brand mismatch: expected={brand!r}, article={brand_from_article!r}"
@@ -912,7 +973,7 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
 
     # Prefer an explicitly stated India launch date. Publication date is the
     # fallback only when the article does not state a launch date.
-    explicit_launch_date = extract_launch_date_from_text(body, None)
+    explicit_launch_date = extract_launch_date_from_text(article_text, None)
     launch_date = explicit_launch_date or published
     if not launch_date:
         return reject("no publication date or explicit India launch date found")
@@ -924,13 +985,12 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
             f"published={published.isoformat() if published else 'not found'}"
         )
 
-    model = normalize_model_name(publisher_title, brand)
     if not model or len(model) < 3:
         return reject("model name could not be normalized")
 
     article_date_value = published or launch_date
-    print(
-        f"  VERIFIED: {brand} {model} | launch={launch_date.date()} | "
+    debug_log(
+        f"  Verified: {brand} {model} | launch={launch_date.date()} | "
         f"published={article_date_value.date()}"
     )
     return {
@@ -965,7 +1025,7 @@ def discover_source_candidates(source, start, end, test_mode):
         if not title_looks_like_phone_launch(title):
             continue
 
-        print(f"Checking 91mobiles launch article: {title[:100]}")
+        debug_log(f"Checking 91mobiles article: {title[:100]}")
         verified = verify_publisher_article(candidate, brand, start, end, test_mode) if brand else None
         if not verified:
             # Brand may be absent from the card title but present in the actual
@@ -982,7 +1042,7 @@ def discover_source_candidates(source, start, end, test_mode):
                     verified = verify_publisher_article(candidate, brand, start, end, test_mode)
         if not verified:
             if not brand:
-                print(f"  REJECTED [brand not detected from headline]: {title[:100]}")
+                debug_log(f"  Rejected [brand not detected]: {title[:100]}")
             continue
 
         key = (brand, model_key(verified["name"]))
@@ -1308,7 +1368,7 @@ def find_official_product_page(model, brand):
         html = get_html(override_url, timeout=20)
         if html and official_page_is_india(override_url):
             return override_url, html
-        print(f"Official product override unavailable; continuing locator search: {override_url}")
+        debug_log(f"Official product override unavailable; continuing locator search: {override_url}")
 
     # 1) Try common official India product URL patterns first. This avoids
     # search-engine dependence and is very fast for brands such as vivo/realme.
@@ -2411,9 +2471,8 @@ def load_existing(ws):
 def main():
     print("=" * 78)
     print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
-    print("DISCOVERY: 91MOBILES ONLY")
-    print("DATA: OFFICIAL INDIA BRAND WEBSITE; 91MOBILES ARTICLE FALLBACK FOR EXPLICIT VARIANTS")
-    print("IMAGE: 91MOBILES - ONE PRIMARY IMAGE")
+    print("Source: 91mobiles | Product specifications: Official India brand pages")
+    print("Images: One primary image from 91mobiles | Excel: PRODUCT_DATA")
     print("=" * 78)
 
     if not XLSX.exists():
@@ -2448,7 +2507,8 @@ def main():
             f"{start.isoformat()} -> {end.isoformat()}"
         )
 
-    print("Existing combinations:", len(existing))
+    print(f"Existing catalogue combinations: {len(existing)}")
+    print("\n[1/3] Discovering and verifying India launches...")
 
     # --------------------------------------------------------
     # 1. DISCOVERY
@@ -2467,7 +2527,7 @@ def main():
         print("AUTOMATION COMPLETED - NO EXCEL CHANGES.")
         return
 
-    print(f"\nQualified launches: {len(launches)}")
+    print(f"\nVerified India launches found: {len(launches)}")
 
     additions = []
 
@@ -2478,10 +2538,7 @@ def main():
         brand = item["brand"]
         model = item["name"]
 
-        print("\n" + "-" * 70)
-        print(f"PROCESSING: {brand} | {model}")
-        print(f"India release date: {item['discovery_date'].date()}")
-        print(f"91mobiles: {item['url']}")
+        print(f"\n[2/3] {brand} {model}  |  India launch: {item['discovery_date'].date()}")
 
         official_url, official_html = find_official_product_page(
             model, brand
@@ -2491,7 +2548,7 @@ def main():
             print("SKIPPED: official India product page not found.")
             continue
 
-        print("Official India page:", official_url)
+        debug_log("Official India page: " + official_url)
 
         name = product_name_from_official(official_html, model)
         description = official_description(official_html, name)
@@ -2741,8 +2798,7 @@ def main():
             print("SKIPPED: primary 91mobiles product image not found.")
             continue
 
-        print("Primary image:", image)
-        print("Official variants:", len(variants))
+        print(f"Product data verified: {len(variants)} variant(s); primary image found.")
 
         # ----------------------------------------------------
         # 4. DUPLICATE CHECK + ADDITIONS
@@ -2810,14 +2866,13 @@ def main():
 
     wb.save(XLSX)
 
-    print("\n" + "=" * 78)
-    print(f"ROWS ADDED: {len(additions)}")
-    print(f"EXCEL SAVED: {XLSX}")
-    print("image1 = 91mobiles primary product image")
-    print("image1Primary = true")
-    print("image2/image3/image4 = blank")
-    print("AUTOMATION COMPLETED SUCCESSFULLY")
-    print("=" * 78)
+    print("\n[3/3] Saving catalogue updates...")
+    print("-" * 56)
+    print(f"Rows added:       {len(additions)}")
+    print(f"Excel workbook:   {XLSX}")
+    print("Primary image:    91mobiles")
+    print("Status:           COMPLETED SUCCESSFULLY")
+    print("-" * 56)
 
 
 if __name__ == "__main__":
