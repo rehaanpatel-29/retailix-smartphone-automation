@@ -114,26 +114,19 @@ def record_discovery_rejection(reason, title="", url=""):
 
 
 def print_discovery_diagnostics():
+    """Print a compact discovery summary; detailed rejection examples stay opt-in."""
     d = DISCOVERY_DIAGNOSTICS
-    print("\n--- DISCOVERY DIAGNOSTICS ---")
-    print(f"Raw unique articles: {d['raw_articles']}")
-    print(f"Passed phone/launch headline prefilter: {d['title_filter_pass']}")
-    print(f"Rejected by headline prefilter: {d['title_filter_reject']}")
-    print(f"Brand found in listing title: {d['brand_detected_from_listing_title']}")
-    print(f"Brand missing from listing title: {d['brand_missing_from_listing_title']}")
-    print(f"Article verification attempts: {d['verification_attempts']}")
-    print(f"Verified India launches: {d['verified']}")
-    if d["rejections"]:
-        print("Rejection reasons:")
-        for reason, count in sorted(d["rejections"].items(), key=lambda item: (-item[1], item[0])):
-            print(f"  - {reason}: {count}")
-            for example in d["rejection_examples"].get(reason, []):
-                print(f"      {example}")
-    if d["prefilter_examples"]:
-        print("Sample articles rejected before article verification:")
-        for example in d["prefilter_examples"][:8]:
-            print(f"  - {example}")
-    print("--- END DISCOVERY DIAGNOSTICS ---\n")
+    print("\nDISCOVERY SUMMARY")
+    print(f"  Articles reviewed:       {d['raw_articles']}")
+    print(f"  Headline matches:        {d['title_filter_pass']}")
+    print(f"  Article checks:          {d['verification_attempts']}")
+    print(f"  Verified India launches: {d['verified']}")
+    if VERBOSE_LOGS and d["rejections"]:
+        print("  Detailed rejection counts:")
+        for reason, count in sorted(
+            d["rejections"].items(), key=lambda item: (-item[1], item[0])
+        ):
+            print(f"    {reason}: {count}")
 
 
 SESSION = requests.Session()
@@ -271,7 +264,7 @@ def _render_page_with_browser(url, timeout=30):
             try:
                 visible_text = page.locator("body").inner_text(timeout=5000) or ""
             except Exception as exc:
-                print(f"Browser visible-text capture failed for {url}: {exc}")
+                debug_log(f"Browser visible-text capture failed for {url}: {exc}")
 
             # Also capture visible option/input labels generically. This helps
             # with stores that render color swatches as buttons with aria-labels
@@ -299,7 +292,7 @@ def _render_page_with_browser(url, timeout=30):
                     return [...new Set(out)].join('\n');
                 }""") or ""
             except Exception as exc:
-                print(f"Browser selector capture failed for {url}: {exc}")
+                debug_log(f"Browser selector capture failed for {url}: {exc}")
 
             evidence_text = "\n".join(x for x in (visible_text, selector_text) if x).strip()
             if evidence_text:
@@ -310,7 +303,7 @@ def _render_page_with_browser(url, timeout=30):
             )
             return rendered
     except Exception as exc:
-        print(f"Browser render unavailable for {url}: {exc}")
+        debug_log(f"Browser render unavailable for {url}: {exc}")
         return ""
     finally:
         try:
@@ -1132,7 +1125,7 @@ def discover_launches(start, end, test_mode):
     DISCOVERY_DIAGNOSTICS["prefilter_examples"] = []
     launches = discover_source_candidates("91mobiles", start, end, test_mode)
 
-    print("91mobiles verified launch candidates:", len(launches))
+    debug_log("91mobiles verified launch candidates: " + str(len(launches)))
 
     for item in launches:
         item["discovery_date"] = item["release"]
@@ -2500,7 +2493,7 @@ def backup_excel():
         f"{XLSX.stem}_backup_{stamp}{XLSX.suffix}"
     )
     shutil.copy2(XLSX, backup)
-    print("Backup:", backup.name)
+    debug_log("Backup created: " + backup.name)
 
 
 def load_existing(ws):
@@ -2536,11 +2529,12 @@ def load_existing(ws):
 # ------------------------------------------------------------
 
 def main():
-    print("=" * 78)
-    print("RETAILIX DAILY SMARTPHONE AUTOMATION - FINAL")
-    print("Source: 91mobiles | Product specifications: Official India brand pages")
-    print("Images: One primary image from 91mobiles | Excel: PRODUCT_DATA")
-    print("=" * 78)
+    print("\n" + "=" * 62)
+    print("             RETAILIX AUTOMATION REPORT")
+    print("=" * 62)
+    print("Discovery: 91mobiles | Product data: Official India websites")
+    print("Product image: 91mobiles | Destination: PRODUCT_DATA")
+    print("-" * 62)
 
     if not XLSX.exists():
         raise FileNotFoundError(
@@ -2575,7 +2569,7 @@ def main():
         )
 
     print(f"Existing catalogue combinations: {len(existing)}")
-    print("\n[1/3] Discovering and verifying India launches...")
+    print("\nSTEP 1/3 · DISCOVERING INDIA LAUNCHES")
 
     # --------------------------------------------------------
     # 1. DISCOVERY
@@ -2594,7 +2588,7 @@ def main():
         print("AUTOMATION COMPLETED - NO EXCEL CHANGES.")
         return
 
-    print(f"\nVerified India launches found: {len(launches)}")
+    print(f"\nVerified India launches: {len(launches)}")
 
     additions = []
 
@@ -2605,7 +2599,7 @@ def main():
         brand = item["brand"]
         model = item["name"]
 
-        print(f"\n[2/3] {brand} {model}  |  India launch: {item['discovery_date'].date()}")
+        print(f"\nPRODUCT · {brand} {model}  ({item['discovery_date'].date()})")
 
         official_url, official_html = find_official_product_page(
             model, brand
@@ -2639,9 +2633,9 @@ def main():
                         seen_variant_keys.add(variant_key)
                         merged.append(candidate)
                 variants = merged
-                print(
-                    "Official Vivo verified variants merged with page extraction:",
-                    len(variants),
+                debug_log(
+                    "Official Vivo verified variants merged with page extraction: "
+                    + str(len(variants))
                 )
 
         # Some official OPPO product landing pages expose marketing content
@@ -2651,7 +2645,7 @@ def main():
             oppo_specs_url = "https://www.oppo.com/in/smartphones/series-f/f35-5g/specs/"
             oppo_specs_html = get_html(oppo_specs_url, timeout=30)
             if oppo_specs_html:
-                print("Official OPPO specs fallback:", oppo_specs_url)
+                debug_log("Official OPPO specs fallback: " + oppo_specs_url)
                 variants = extract_variants(oppo_specs_html, name)
                 if len(description) < 60:
                     description = official_description(oppo_specs_html, name)
@@ -2678,7 +2672,7 @@ def main():
         if not variants and brand.upper() == "OPPO" and "f35" in model.lower():
             variants = official_fallback_variants(brand, model)
             if variants:
-                print("Official OPPO F35 verified variant fallback: 6")
+                debug_log("Official OPPO F35 verified variant fallback: 6")
 
         # Samsung Galaxy F70: the known /specs/ endpoint has repeatedly
         # returned HTTP 404 in GitHub Actions. Do not request that known-bad
@@ -2701,7 +2695,7 @@ def main():
             # colour, RAM, and storage in one explicit SKU/configuration.
             if not variants:
                 sku_pages = discover_samsung_f70_sku_pages(model, official_html)
-                print("Samsung official F70 SKU pages discovered:", len(sku_pages))
+                debug_log("Samsung official F70 SKU pages discovered: " + str(len(sku_pages)))
                 seen_samsung_variants = set()
                 for sku_url in sku_pages:
                     sku_html = get_html(sku_url, timeout=25)
@@ -2740,10 +2734,9 @@ def main():
                         article_variants = extract_variants(article_html, name)
                         if article_variants:
                             variants = article_variants
-                            print(
-                                "Samsung-only 91mobiles variant fallback: ",
-                                len(variants),
-                                "explicit configuration(s) extracted."
+                            debug_log(
+                                "Samsung-only 91mobiles variant fallback: "
+                                + str(len(variants)) + " explicit configuration(s) extracted."
                             )
                         else:
                             # The article reports RAM/storage pairs and the
@@ -2792,18 +2785,17 @@ def main():
                                     for storage, ram in f70_configs
                                     for color in f70_colors
                                 ]
-                                print(
-                                    "Samsung-only 91mobiles fallback parsed:",
-                                    len(f70_configs), "RAM/storage options and",
-                                    len(f70_colors), "colours; combinations:",
-                                    len(variants),
+                                debug_log(
+                                    "Samsung-only 91mobiles fallback parsed: "
+                                    + str(len(f70_configs)) + " RAM/storage options, "
+                                    + str(len(f70_colors)) + " colours, "
+                                    + str(len(variants)) + " combinations"
                                 )
                             else:
-                                print(
-                                    "Samsung-only 91mobiles fallback incomplete:",
-                                    "RAM/storage options=", len(f70_configs),
-                                    "colours=", len(f70_colors),
-                                    "— keeping the phone unadded rather than guessing."
+                                debug_log(
+                                    "Samsung-only 91mobiles fallback incomplete: "
+                                    f"RAM/storage options={len(f70_configs)}, "
+                                    f"colours={len(f70_colors)}; phone not added."
                                 )
 
             if not variants:
@@ -2829,7 +2821,7 @@ def main():
                     seen_variant_keys.add(variant_key)
                     merged.append(candidate)
             variants = merged
-            print("Official Infinix Smart 20 HD verified variants merged with page extraction:", len(variants))
+            debug_log("Official Infinix Smart 20 HD verified variants merged: " + str(len(variants)))
 
         # Cross-brand recovery: if an official product page is found but its
         # SKU selector is not exposed to the crawler, use only explicit
@@ -2895,7 +2887,7 @@ def main():
             existing.add(key)
             added_for_phone += 1
 
-        print(f"New variants to add: {added_for_phone}")
+        print(f"  New variants: {added_for_phone}")
 
     # --------------------------------------------------------
     # 5. WRITE EXCEL
@@ -2933,13 +2925,13 @@ def main():
 
     wb.save(XLSX)
 
-    print("\n[3/3] Saving catalogue updates...")
-    print("-" * 56)
-    print(f"Rows added:       {len(additions)}")
-    print(f"Excel workbook:   {XLSX}")
-    print("Primary image:    91mobiles")
-    print("Status:           COMPLETED SUCCESSFULLY")
-    print("-" * 56)
+    print("\nSTEP 3/3 · CATALOGUE UPDATE")
+    print("-" * 46)
+    print(f"  Rows added:      {len(additions)}")
+    print(f"  Workbook:        {XLSX}")
+    print("  Primary image:   91mobiles")
+    print("  Result:          COMPLETED SUCCESSFULLY")
+    print("-" * 46)
 
 
 if __name__ == "__main__":
