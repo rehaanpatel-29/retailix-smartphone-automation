@@ -2,33 +2,36 @@ name: RetailiX Daily Smartphone Automation
 
 on:
   schedule:
-    # 12:00 AM IST = 18:30 UTC
-    - cron: "30 18 * * *"
-
+    - cron: "30 18 * * *" # 12:00 AM IST
   workflow_dispatch:
     inputs:
-      test_date:
-        description: "Optional test date (YYYY-MM-DD). Leave blank for normal previous-24h mode."
+      scan_mode:
+        description: "Choose the discovery window"
+        required: true
+        type: choice
+        options:
+          - seven_days
+          - single_date
+        default: seven_days
+      scan_date:
+        description: "Required only for single_date mode (YYYY-MM-DD, India date)"
         required: false
-        default: ""
         type: string
-
-# Prevent two runs from modifying the same Excel file at the same time.
-concurrency:
-  group: retailix-smartphone-automation
-  cancel-in-progress: false
 
 permissions:
   contents: write
 
-env:
-  RETAILIX_TEST_DATE: ${{ inputs.test_date }}
+concurrency:
+  group: retailix-daily-smartphone-automation
+  cancel-in-progress: false
 
 jobs:
   run-automation:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 20
+    env:
+      RETAILIX_SCAN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode || 'seven_days' }}
+      RETAILIX_SCAN_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_date || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,26 +41,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python packages
+      - name: Install packages
         run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 openpyxl playwright
-          python -m playwright install --with-deps chromium
+          pip install openpyxl requests beautifulsoup4 playwright feedparser
+          python -m playwright install chromium
 
-      - name: Run RetailiX automation
-        run: |
-          python main.py
+      - name: Run smartphone automation
+        run: python main.py
 
       - name: Save updated Excel file
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add "product_import_template (1).xlsx"
-
-          if git diff --cached --quiet; then
-            echo "No Excel changes to commit."
-          else
-            git commit -m "Daily smartphone import update"
+          if [[ -n "$(git status --porcelain -- 'product_import_template (1).xlsx')" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- 'product_import_template (1).xlsx'
+            git commit -m "Update smartphone catalogue"
             git push
+          else
+            echo "No Excel changes to commit."
           fi
