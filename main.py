@@ -89,6 +89,53 @@ def debug_log(message):
         print(message)
 
 
+# Per-run discovery diagnostics. These counters explain where discovered
+# articles are rejected without weakening the final launch-verification rules.
+DISCOVERY_DIAGNOSTICS = {
+    "raw_articles": 0,
+    "title_filter_pass": 0,
+    "title_filter_reject": 0,
+    "brand_detected_from_listing_title": 0,
+    "brand_missing_from_listing_title": 0,
+    "verification_attempts": 0,
+    "verified": 0,
+    "rejections": {},
+    "rejection_examples": {},
+    "prefilter_examples": [],
+}
+
+
+def record_discovery_rejection(reason, title="", url=""):
+    reasons = DISCOVERY_DIAGNOSTICS["rejections"]
+    reasons[reason] = reasons.get(reason, 0) + 1
+    examples = DISCOVERY_DIAGNOSTICS["rejection_examples"].setdefault(reason, [])
+    if len(examples) < 3:
+        examples.append(f"{clean(title)[:110]} | {url}")
+
+
+def print_discovery_diagnostics():
+    d = DISCOVERY_DIAGNOSTICS
+    print("\n--- DISCOVERY DIAGNOSTICS ---")
+    print(f"Raw unique articles: {d['raw_articles']}")
+    print(f"Passed phone/launch headline prefilter: {d['title_filter_pass']}")
+    print(f"Rejected by headline prefilter: {d['title_filter_reject']}")
+    print(f"Brand found in listing title: {d['brand_detected_from_listing_title']}")
+    print(f"Brand missing from listing title: {d['brand_missing_from_listing_title']}")
+    print(f"Article verification attempts: {d['verification_attempts']}")
+    print(f"Verified India launches: {d['verified']}")
+    if d["rejections"]:
+        print("Rejection reasons:")
+        for reason, count in sorted(d["rejections"].items(), key=lambda item: (-item[1], item[0])):
+            print(f"  - {reason}: {count}")
+            for example in d["rejection_examples"].get(reason, []):
+                print(f"      {example}")
+    if d["prefilter_examples"]:
+        print("Sample articles rejected before article verification:")
+        for example in d["prefilter_examples"][:8]:
+            print(f"  - {example}")
+    print("--- END DISCOVERY DIAGNOSTICS ---\n")
+
+
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": (
@@ -950,6 +997,7 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
     title = clean(candidate.get("title", ""))
 
     def reject(reason):
+        record_discovery_rejection(reason, title, url)
         debug_log(f"  Rejected [{reason}]: {title[:90]} | {url}")
         return None
 
@@ -1021,49 +1069,47 @@ def verify_publisher_article(candidate, brand, start, end, test_mode=False):
 def discover_source_candidates(source, start, end, test_mode):
     out = {}
     raw_candidates = direct_source_candidates(source, start, end, test_mode)
+    DISCOVERY_DIAGNOSTICS["raw_articles"] = len(raw_candidates)
 
     for candidate in raw_candidates:
-        # Do not discard a candidate using the date parsed from a listing-card
-        # parent. Those cards can contain unrelated dates (for example, a
-        # date belonging to another article in the same container). Historical
-        # discovery already has a bounded page limit; the directly fetched
-        # article's publication date and launch-date evidence are checked in
-        # verify_publisher_article(), which is the authoritative date gate.
         title = clean(candidate.get("title", ""))
         brand = detect_brand(title)
-
-        # Keep the prefilter broad enough for titles that omit a brand name
-        # (for example, a model-family headline). The article body is checked
-        # for the brand before it can qualify, so this does not broaden the
-        # final accepted brand set.
-        if not title_looks_like_phone_launch(title):
+        title_passes = title_looks_like_phone_launch(title)
+        if title_passes:
+            DISCOVERY_DIAGNOSTICS["title_filter_pass"] += 1
+        else:
+            DISCOVERY_DIAGNOSTICS["title_filter_reject"] += 1
+            if len(DISCOVERY_DIAGNOSTICS["prefilter_examples"]) < 20:
+                DISCOVERY_DIAGNOSTICS["prefilter_examples"].append(
+                    f"{title[:110]} | {candidate.get('url', '')}"
+                )
+            # Keep the existing strict filter for final acceptance, but record
+            # its impact explicitly. This run is diagnostic; it does not relax
+            # launch verification or accept an article based on discovery text.
             continue
+
+        if brand:
+            DISCOVERY_DIAGNOSTICS["brand_detected_from_listing_title"] += 1
+        else:
+            DISCOVERY_DIAGNOSTICS["brand_missing_from_listing_title"] += 1
 
         debug_log(f"Checking 91mobiles article: {title[:100]}")
-        verified = verify_publisher_article(candidate, brand, start, end, test_mode) if brand else None
-        if not verified:
-            # Brand may be absent from the card title but present in the actual
-            # article H1/body. Fetch once, detect the brand, then run the normal
-            # verifier against the same 91mobiles URL.
-            raw_html = get_html(candidate.get("url", ""), timeout=20)
-            if raw_html:
-                raw_soup = BeautifulSoup(raw_html, "html.parser")
-                raw_h1 = raw_soup.find("h1")
-                raw_title = clean(raw_h1.get_text(" ", strip=True)) if raw_h1 else title
-                raw_body = clean(raw_soup.get_text(" ", strip=True))
-                brand = detect_brand(raw_title) or detect_brand(raw_body[:15000])
-                if brand:
-                    verified = verify_publisher_article(candidate, brand, start, end, test_mode)
-        if not verified:
-            if not brand:
-                debug_log(f"  Rejected [brand not detected]: {title[:100]}")
+        if not brand:
+            record_discovery_rejection("brand not detected in listing title", title, candidate.get("url", ""))
             continue
 
+        DISCOVERY_DIAGNOSTICS["verification_attempts"] += 1
+        verified = verify_publisher_article(candidate, brand, start, end, test_mode)
+        if not verified:
+            continue
+
+        DISCOVERY_DIAGNOSTICS["verified"] += 1
         key = (brand, model_key(verified["name"]))
         previous = out.get(key)
         if previous is None or verified["article_date"] > previous["article_date"]:
             out[key] = verified
 
+    print_discovery_diagnostics()
     return list(out.values())
 
 
@@ -1077,6 +1123,13 @@ def discover_launches(start, end, test_mode):
          upcoming launch, review, sale-only update, or global-only launch.
       4. Only phones inside the requested window qualify.
     """
+    for key in ("raw_articles", "title_filter_pass", "title_filter_reject",
+                "brand_detected_from_listing_title", "brand_missing_from_listing_title",
+                "verification_attempts", "verified"):
+        DISCOVERY_DIAGNOSTICS[key] = 0
+    DISCOVERY_DIAGNOSTICS["rejections"] = {}
+    DISCOVERY_DIAGNOSTICS["rejection_examples"] = {}
+    DISCOVERY_DIAGNOSTICS["prefilter_examples"] = []
     launches = discover_source_candidates("91mobiles", start, end, test_mode)
 
     print("91mobiles verified launch candidates:", len(launches))
