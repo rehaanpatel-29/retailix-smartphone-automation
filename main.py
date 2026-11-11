@@ -474,40 +474,40 @@ def article_date(html):
 
 
 def get_release_window():
-    """Use a rolling 7-day production window; allow explicit recent-day tests.
+    """Select either one complete India calendar date or the rolling last 7 days.
 
-    A stale RETAILIX_TEST_DATE was accidentally left enabled in repeated
-    workflow runs. Dates older than the rolling recovery window are therefore
-    ignored unless RETAILIX_ALLOW_HISTORICAL_TEST=1 is explicitly set.
+    GitHub Actions supplies RETAILIX_SCAN_MODE and RETAILIX_SCAN_DATE.
+    RETAILIX_TEST_DATE remains supported for backwards compatibility.
     """
-    test_date = os.getenv("RETAILIX_TEST_DATE", "").strip()
+    mode = os.getenv("RETAILIX_SCAN_MODE", "seven_days").strip().lower()
+    selected_date = (
+        os.getenv("RETAILIX_SCAN_DATE", "").strip()
+        or os.getenv("RETAILIX_TEST_DATE", "").strip()
+    )
     allow_historical = os.getenv("RETAILIX_ALLOW_HISTORICAL_TEST", "").strip().lower() in {
         "1", "true", "yes"
     }
 
-    if test_date:
-        try:
-            day = datetime.strptime(test_date, "%Y-%m-%d").date()
-        except ValueError as exc:
-            raise RuntimeError(
-                "RETAILIX_TEST_DATE must use YYYY-MM-DD, e.g. 2026-11-09"
-            ) from exc
+    if mode not in {"single_date", "seven_days"}:
+        raise RuntimeError("RETAILIX_SCAN_MODE must be 'single_date' or 'seven_days'.")
 
-        today = now().date()
-        oldest_allowed = today - timedelta(days=7)
-        if day < oldest_allowed and not allow_historical:
-            print(
-                "WARNING: ignoring stale RETAILIX_TEST_DATE=" + test_date
-                + f" (today={today}; older than the 7-day recovery window)."
+    if mode == "single_date":
+        if not selected_date:
+            raise RuntimeError("Single-date mode requires RETAILIX_SCAN_DATE (YYYY-MM-DD).")
+        try:
+            day = datetime.strptime(selected_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise RuntimeError("RETAILIX_SCAN_DATE must use YYYY-MM-DD, e.g. 2026-11-11") from exc
+        if day > now().date():
+            raise RuntimeError("RETAILIX_SCAN_DATE cannot be in the future (India time).")
+        if day < now().date() - timedelta(days=7) and not allow_historical:
+            raise RuntimeError(
+                "Selected date is older than 7 days. Set RETAILIX_ALLOW_HISTORICAL_TEST=1 "
+                "only for an intentional historical test."
             )
-            print(
-                "For an intentional historical test only, set "
-                "RETAILIX_ALLOW_HISTORICAL_TEST=1."
-            )
-        else:
-            start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
-            end = start + timedelta(days=1) - timedelta(microseconds=1)
-            return start, end, True
+        start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
+        end = start + timedelta(days=1) - timedelta(microseconds=1)
+        return start, end, True
 
     end = now()
     start = end - timedelta(days=7)
@@ -814,7 +814,15 @@ def parse_91mobiles_category(html):
 
     for a in soup.find_all("a", href=True):
         href = normalize_url(a.get("href"), NINETYONE_MOBILES_CATEGORY)
-        title = clean(a.get_text(" ", strip=True))
+        # Some 91mobiles cards use image-only anchors or put the headline in
+        # title/aria-label attributes. Text-only extraction silently missed
+        # those cards and was a major source of discovery gaps.
+        title = clean(
+            a.get_text(" ", strip=True)
+            or a.get("title")
+            or a.get("aria-label")
+            or (a.find("img").get("alt") if a.find("img") else "")
+        )
         path = urlparse(href).path.lower()
 
         if not href or href in seen:
@@ -828,7 +836,13 @@ def parse_91mobiles_category(html):
         if "/category/" in path or "/page/" in path:
             continue
         if len(title) < 20:
-            continue
+            # Last-resort slug title: it is only a discovery hint. The fetched
+            # article H1/body and India-launch evidence remain mandatory.
+            slug = path.rstrip("/").split("/")[-1].replace("-", " ")
+            if len(slug) >= 20:
+                title = clean(slug)
+            else:
+                continue
 
         # Listing cards normally contain the publication date in a nearby
         # parent block. If it is not found, the article itself will supply
@@ -2498,13 +2512,13 @@ def main():
 
     if test_mode:
         print(
-            "TEST MODE ENABLED: checking the full India calendar day "
-            f"{start.date()}"
+            "SINGLE-DATE MODE: checking the full India calendar day "
+            f"{start.date()} (IST)"
         )
     else:
         print(
-            f"7-DAY RECOVERY WINDOW: "
-            f"{start.isoformat()} -> {end.isoformat()}"
+            f"7-DAY MODE: checking "
+            f"{start.isoformat()} -> {end.isoformat()} (IST)"
         )
 
     print(f"Existing catalogue combinations: {len(existing)}")
